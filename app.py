@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.1.0"
+APP_VERSION = "14.1.1"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -32,10 +32,21 @@ EXTRACT_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
 DEFAULT_ORIGINS = [
     "https://sbtechinfo.liveblog365.com",
     "http://sbtechinfo.liveblog365.com",
+    "https://singtonid.liveblog365.com",
+    "http://singtonid.liveblog365.com",
     "http://127.0.0.1:8000",
     "http://localhost:8000",
 ]
-origins = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", ",".join(DEFAULT_ORIGINS)).split(",") if x.strip()]
+
+# Always keep the known frontend origins enabled, even when Render has an
+# older ALLOWED_ORIGINS environment variable configured. Extra origins can
+# still be added through ALLOWED_ORIGINS as a comma-separated list.
+env_origins = [
+    x.strip()
+    for x in os.getenv("ALLOWED_ORIGINS", "").split(",")
+    if x.strip()
+]
+origins = list(dict.fromkeys(DEFAULT_ORIGINS + env_origins))
 
 app = FastAPI(title="NID Bengali Field OCR API", version=APP_VERSION)
 app.add_middleware(

@@ -8,7 +8,7 @@ services:
     autoDeployTrigger: commit
     envVars:
       - key: ALLOWED_ORIGINS
-        value: https://sbtechinfo.liveblog365.com
+        value: https://sbtechinfo.liveblog365.com,https://singtonid.liveblog365.com
       - key: OCR_LANG
         value: ben+eng
       - key: OCR_SCALE
