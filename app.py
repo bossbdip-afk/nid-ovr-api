@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.3.0"
+APP_VERSION = "14.4.0"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -417,6 +417,93 @@ def _section_y(lines: list[dict[str, Any]], labels: Iterable[str]) -> float | No
     return None
 
 
+def _label_rect_on_line(line: dict[str, Any], label: str) -> fitz.Rect | None:
+    hit = _match_label_words(line["words"], label)
+    if not hit:
+        return None
+    i, j = hit
+    rect = fitz.Rect(line["words"][i][:4])
+    for k in range(i + 1, j + 1):
+        rect |= fitz.Rect(line["words"][k][:4])
+    return rect
+
+
+def _address_value(lines: list[dict[str, Any]], labels: Iterable[str], *, y_min: float, y_max: float | None) -> tuple[str, dict[str, Any]]:
+    """Extract one address value from the positioned text layer.
+
+    NID PDFs often put several logical cells on one PDF text line. The older
+    fast parser consumed words after a label until a guessed pixel gap, which
+    could accidentally swallow the next label (e.g. "Postal Code - 2020,
+    Union/Ward"). This routine uses label geometry and stops at the next known
+    address label on the same visual row.
+    """
+    all_labels = [
+        "Additional Village/Road", "Village/Road", "Home/Holding No",
+        "Home/Holding", "Post Office", "Post Ofcfie", "Postal Code",
+        "Post Code", "Upozila", "Upazila", "Union/Ward", "District",
+    ]
+    wanted = list(labels)
+    for label in wanted:
+        for line in lines:
+            cy = (line["rect"].y0 + line["rect"].y1) / 2
+            if cy < y_min or (y_max is not None and cy >= y_max):
+                continue
+            hit = _match_label_words(line["words"], label)
+            if not hit:
+                continue
+            i, j = hit
+            words = line["words"]
+            label_rect = fitz.Rect(words[i][:4])
+            for k in range(i + 1, j + 1):
+                label_rect |= fitz.Rect(words[k][:4])
+
+            # Find the x-position of the next label on this same visual row.
+            stop_x = None
+            for other_label in all_labels:
+                if norm_label(other_label) == norm_label(label):
+                    continue
+                other = _label_rect_on_line(line, other_label)
+                if other is not None and other.x0 > label_rect.x1 + 1:
+                    stop_x = other.x0 if stop_x is None else min(stop_x, other.x0)
+
+            value_words = []
+            for w in words[j + 1:]:
+                x0, _, x1, _, text = w[:5]
+                if x0 <= label_rect.x1 + 1:
+                    continue
+                if stop_x is not None and x0 >= stop_x - 1:
+                    break
+                value_words.append(str(text))
+            value = clean_text(" ".join(value_words))
+            if meaningful(value):
+                return (clean_bengali(value) if BENGALI_RE.search(value) else value), {"source": "pdf_words_address_fast"}
+
+            # Value may live in a separate text span/block. Pick the nearest
+            # right-side line on the same row, but never return another label.
+            best = None
+            label_norms = {norm_label(x) for x in all_labels}
+            for other in lines:
+                if other is line:
+                    continue
+                ocy = (other["rect"].y0 + other["rect"].y1) / 2
+                if ocy < y_min or (y_max is not None and ocy >= y_max):
+                    continue
+                if other["rect"].x0 <= label_rect.x1 + 1:
+                    continue
+                if abs(ocy - cy) > max(8.0, label_rect.height * 0.9):
+                    continue
+                txt = clean_text(other["text"])
+                if not meaningful(txt) or norm_label(txt) in label_norms:
+                    continue
+                score = (abs(ocy - cy), other["rect"].x0 - label_rect.x1)
+                if best is None or score < best[0]:
+                    best = (score, txt)
+            if best is not None:
+                value = best[1]
+                return (clean_bengali(value) if BENGALI_RE.search(value) else value), {"source": "pdf_words_address_row_fast"}
+    return "", {"source": "missing"}
+
+
 def fast_address(page: fitz.Page, lines: list[dict[str, Any]], section: str, next_section: str | None) -> tuple[str, dict[str, Any]]:
     start = _section_y(lines, [section])
     if start is None:
@@ -425,17 +512,18 @@ def fast_address(page: fitz.Page, lines: list[dict[str, Any]], section: str, nex
     y_min = start + 1
     y_max = end
 
-    def fv(labels, bengali=True):
-        v, m = fast_value(page, lines, labels, y_min=y_min, y_max=y_max)
+    def av(labels, bengali=True):
+        v, m = _address_value(lines, labels, y_min=y_min, y_max=y_max)
         return (clean_bengali(v) if bengali else clean_text(v)), m
 
-    additional_village, m_add = fv(["Additional Village/Road"])
-    village, m_vil = fv(["Village/Road"])
-    holding, m_hold = fv(["Home/Holding No", "Home/Holding"], False)
-    post, m_post = fv(["Post Office", "Post Ofcfie"])
-    postal, m_postal = fv(["Postal Code", "Post Code"], False)
-    upazila, m_up = fv(["Upozila", "Upazila"])
-    district, m_dist = fv(["District"])
+    additional_village, m_add = av(["Additional Village/Road"])
+    village, m_vil = av(["Village/Road"])
+    holding, m_hold = av(["Home/Holding No", "Home/Holding"], False)
+    post, m_post = av(["Post Office", "Post Ofcfie"])
+    postal, m_postal = av(["Postal Code", "Post Code"], False)
+    union_ward, m_union = av(["Union/Ward"])
+    upazila, m_up = av(["Upozila", "Upazila"])
+    district, m_dist = av(["District"])
 
     v = additional_village or village
     if not meaningful(holding):
@@ -449,15 +537,17 @@ def fast_address(page: fitz.Page, lines: list[dict[str, Any]], section: str, nex
         parts.append("ডাকঘর: " + post + ((" - " + postal) if postal else ""))
     elif postal:
         parts.append("পোস্ট কোড: " + postal)
+    if union_ward:
+        parts.append(union_ward)
     if upazila:
         parts.append(upazila)
     if district:
         parts.append(district)
     return clean_bengali(", ".join(parts)), {
         "source": "pdf_words_fast", "village": m_add if additional_village else m_vil,
-        "holding": m_hold, "post": m_post, "postal": m_postal, "upazila": m_up, "district": m_dist,
+        "holding": m_hold, "post": m_post, "postal": m_postal, "unionWard": m_union,
+        "upazila": m_up, "district": m_dist,
     }
-
 
 def extract_fast_text(doc: fitz.Document) -> tuple[dict[str, str], dict[str, Any], bool]:
     p1 = doc[0]
@@ -513,7 +603,11 @@ def extract_fast_text(doc: fitz.Document) -> tuple[dict[str, str], dict[str, Any
     # Require the core identity rows before trusting the no-table fast path.
     core = ["nid", "pin", "voterNo", "nameBn", "nameEn", "dob", "father", "mother", "gender"]
     found = sum(1 for k in core if meaningful(fields.get(k)))
-    usable = found >= 7 and meaningful(fields.get("nid")) and meaningful(fields.get("voterNo"))
+    address_ok = meaningful(fields.get("presentAddress")) and (
+        "গ্রাম/রাস্তা:" in fields.get("presentAddress", "")
+        and ("ডাকঘর:" in fields.get("presentAddress", "") or "পোস্ট কোড:" in fields.get("presentAddress", ""))
+    )
+    usable = found >= 7 and meaningful(fields.get("nid")) and meaningful(fields.get("voterNo")) and address_ok
     return fields, debug, usable
 
 
@@ -705,7 +799,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
                 fields[k] = clean_text(v)
         return {
             "ok": True,
-            "engine": "python-pymupdf-fast-text-v14.3",
+            "engine": "python-pymupdf-fast-text-v14.4",
             "version": APP_VERSION,
             "ocr_available": tesseract_available(),
             "pages": doc.page_count,
@@ -799,7 +893,7 @@ def extract_document_table_fallback(pdf_bytes: bytes) -> dict[str, Any]:
 
     return {
         "ok": True,
-        "engine": "python-pymupdf-fast-text-v14.3",
+        "engine": "python-pymupdf-fast-text-v14.4",
         "version": APP_VERSION,
         "ocr_available": tesseract_available(),
         "pages": doc.page_count,
@@ -812,7 +906,7 @@ def extract_document_table_fallback(pdf_bytes: bytes) -> dict[str, Any]:
 def root() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-fast-text-v14.3",
+        "engine": "python-pymupdf-fast-text-v14.4",
         "version": APP_VERSION,
         "message": "NID Bengali OCR API is running. Use /health or POST /extract.",
     }
@@ -822,7 +916,7 @@ def root() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-fast-text-v14.3",
+        "engine": "python-pymupdf-fast-text-v14.4",
         "version": APP_VERSION,
         "pymupdf": fitz.VersionBind,
         "tesseract": tesseract_available(),
