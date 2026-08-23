@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "16.0.0-safe-demo"
+APP_VERSION = "14.0.0"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "3.2"))
@@ -458,6 +458,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
         fields[key], debug[key] = simple_value(p1, t1, labels, ocr_bengali=use_ocr)
 
     fields["presentAddress"], debug["presentAddress"] = build_address(p1, t1, "Present Address", "Permanent Address")
+    fields["permanentAddress"], debug["permanentAddress"] = build_address(p1, t1, "Permanent Address", "Foreign Address")
 
     t2 = get_table(p2) if p2 is not None else None
     if p2 is not None and t2 is not None:
@@ -471,7 +472,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 
     # Final generic normalization pass. Do not invent missing values.
     for k, v in list(fields.items()):
-        if k in {"nameBn", "father", "mother", "spouse", "birthPlace", "voterArea", "presentAddress"}:
+        if k in {"nameBn", "father", "mother", "spouse", "birthPlace", "voterArea", "presentAddress", "permanentAddress"}:
             fields[k] = clean_bengali(v)
         else:
             fields[k] = clean_text(v)
