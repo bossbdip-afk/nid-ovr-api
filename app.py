@@ -20,10 +20,11 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.0.0"
+APP_VERSION = "14.1.0"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
-OCR_SCALE = float(os.getenv("OCR_SCALE", "3.2"))
+OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
+OCR_MODE = os.getenv("OCR_MODE", "auto").strip().lower()  # auto | always | off
 EXTRACT_TIMEOUT_SECONDS = float(os.getenv("EXTRACT_TIMEOUT_SECONDS", "120"))
 MAX_CONCURRENT_EXTRACTS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTS", "1")))
 EXTRACT_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
@@ -158,8 +159,31 @@ class OcrCandidate:
     confidence: float = 0.0
 
 
+_TESSERACT_AVAILABLE = bool(pytesseract is not None and shutil.which("tesseract"))
+
 def tesseract_available() -> bool:
-    return bool(pytesseract is not None and shutil.which("tesseract"))
+    return _TESSERACT_AVAILABLE
+
+def should_run_ocr(raw: Any) -> bool:
+    """Fast-path policy for OCR.
+
+    Tesseract startup is expensive on Render's small instances. The old code
+    launched it twice for every Bengali cell even when the PDF text layer was
+    already clean, which could turn one request into 20+ OCR subprocesses.
+    In auto mode we trust clean embedded PDF text and OCR only missing or
+    visibly damaged Bengali values. Set OCR_MODE=always to restore v14.0
+    behavior, or OCR_MODE=off to disable OCR entirely.
+    """
+    if OCR_MODE == "off":
+        return False
+    if OCR_MODE == "always":
+        return True
+    raw_s = clean_text(raw)
+    if not meaningful(raw_s):
+        return True
+    if not BENGALI_RE.search(raw_s):
+        return False
+    return obvious_damage(raw_s) > 0
 
 
 def _ocr_image(img: Image.Image, psm: int) -> OcrCandidate:
@@ -212,7 +236,12 @@ def ocr_cell(page: fitz.Page, bbox: Any, *, allow_ascii: bool = True) -> OcrCand
     # Add white padding so glyphs touching a cell edge are not clipped.
     gray = ImageOps.expand(gray, border=max(5, int(gray.height * 0.12)), fill=255)
 
-    candidates = [_ocr_image(gray, 7), _ocr_image(gray, 6)]
+    # PSM 7 is the normal one-line cell path. A second Tesseract subprocess
+    # is only worth paying for when the first pass is weak.
+    first = _ocr_image(gray, 7)
+    candidates = [first]
+    if not first.text or first.confidence < 52:
+        candidates.append(_ocr_image(gray, 6))
     best = max(candidates, key=lambda c: (c.confidence, len(c.text)))
     best.text = clean_bengali(best.text, allow_ascii=allow_ascii)
     return best
@@ -317,6 +346,8 @@ def simple_value(page: fitz.Page, table, labels: Iterable[str], *, ocr_bengali: 
     raw_clean = clean_bengali(raw) if BENGALI_RE.search(str(raw or "")) else clean_text(raw)
     if not ocr_bengali or not BENGALI_RE.search(str(raw or "")):
         return raw_clean, {"source": "pdf_table"}
+    if not should_run_ocr(raw):
+        return raw_clean, {"source": "pdf_table_fast"}
     cell = table.rows[ri].cells[1] if len(table.rows[ri].cells) > 1 else None
     ocr = ocr_cell(page, cell)
     value, source, conf = choose_text(str(raw or ""), ocr)
@@ -370,6 +401,8 @@ def address_field(page: fitz.Page, table, row_indices: list[int], labels: list[s
         raw_clean = clean_bengali(raw)
         if not ocr_bengali or not BENGALI_RE.search(str(raw or "")):
             return raw_clean, {"source": "pdf_table"}
+        if not should_run_ocr(raw):
+            return raw_clean, {"source": "pdf_table_fast"}
         cell = table.rows[ri].cells[vi] if vi < len(table.rows[ri].cells) else None
         ocr = ocr_cell(page, cell)
         value, source, conf = choose_text(str(raw or ""), ocr)
@@ -479,7 +512,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14",
+        "engine": "python-pymupdf-visual-ocr-v14.1",
         "version": APP_VERSION,
         "ocr_available": tesseract_available(),
         "pages": doc.page_count,
@@ -492,7 +525,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 def root() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14",
+        "engine": "python-pymupdf-visual-ocr-v14.1",
         "version": APP_VERSION,
         "message": "NID Bengali OCR API is running. Use /health or POST /extract.",
     }
@@ -502,11 +535,13 @@ def root() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14",
+        "engine": "python-pymupdf-visual-ocr-v14.1",
         "version": APP_VERSION,
         "pymupdf": fitz.VersionBind,
         "tesseract": tesseract_available(),
         "ocr_lang": OCR_LANG,
+        "ocr_mode": OCR_MODE,
+        "ocr_scale": OCR_SCALE,
     }
 
 

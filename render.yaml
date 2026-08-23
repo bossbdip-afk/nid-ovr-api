@@ -12,7 +12,9 @@ services:
       - key: OCR_LANG
         value: ben+eng
       - key: OCR_SCALE
-        value: "3.2"
+        value: "2.2"
+      - key: OCR_MODE
+        value: auto
       - key: MAX_PDF_BYTES
         value: "15728640"
       - key: MAX_CONCURRENT_EXTRACTS
