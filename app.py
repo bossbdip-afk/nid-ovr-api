@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.1.1"
+APP_VERSION = "14.2.0"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -487,7 +487,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     simple_specs = {
         "nid": (["National ID"], False),
         "pin": (["Pin"], False),
-        "siNo": (["Sl No", "SI No"], False),
+        "siNo": (["Sl No", "SI No", "SL No", "Serial No", "Serial Number", "S/L No"], False),
         "voterNo": (["Voter No"], False),
         "nameBn": (["Name(Bangla)"], True),
         "nameEn": (["Name(English)"], False),
@@ -500,6 +500,22 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     }
     for key, (labels, use_ocr) in simple_specs.items():
         fields[key], debug[key] = simple_value(p1, t1, labels, ocr_bengali=use_ocr)
+
+    # Some NID PDFs expose the serial label outside the detected table or split
+    # the label/value into separate text spans. If the normal table lookup did
+    # not find it, use the embedded text layer as a cheap fallback (no OCR).
+    if not meaningful(fields.get("siNo")):
+        page_text = clean_text(p1.get_text("text"))
+        serial_patterns = [
+            r"(?:S\s*/\s*L|SL|Sl|SI|Serial)\s*\.?\s*(?:No|Number)\s*[:#.-]?\s*([A-Za-z0-9/-]{2,})",
+            r"(?:ক্রমিক|সিরিয়াল)\s*(?:নং|নম্বর)?\s*[:#.-]?\s*([A-Za-z0-9০-৯/-]{2,})",
+        ]
+        for pat in serial_patterns:
+            m = re.search(pat, page_text, flags=re.IGNORECASE)
+            if m:
+                fields["siNo"] = clean_text(m.group(1))
+                debug["siNo"] = {"source": "pdf_text_fallback"}
+                break
 
     fields["presentAddress"], debug["presentAddress"] = build_address(p1, t1, "Present Address", "Permanent Address")
     fields["permanentAddress"], debug["permanentAddress"] = build_address(p1, t1, "Permanent Address", "Foreign Address")
