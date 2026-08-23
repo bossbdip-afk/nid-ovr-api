@@ -7,13 +7,12 @@ Endpoints:
 - `GET /health` health check
 - `POST /extract` multipart PDF field extraction
 
-This repo includes `render.yaml` and a Dockerfile for Render deployment.
+## v14.3 performance + serial fix
+- Added a positioned-text fast path that runs before PyMuPDF `find_tables()`.
+- Normal text-layer PDFs avoid expensive table detection and OCR.
+- `find_tables()` + Tesseract remain as compatibility fallback for unusual/scanned PDFs.
+- Serial value `0` is treated as a placeholder/missing value.
+- Serial is recovered from `Sl No`, `SI No`, `SL No`, `S/L No`, `Serial No`, or `Serial Number` text.
+- Existing CORS support for `singtonid.liveblog365.com` is preserved.
 
-## v14.1 performance update
-- Default `OCR_MODE=auto`: clean Bengali text from the PDF layer skips Tesseract.
-- OCR runs only for visibly damaged Bengali text.
-- OCR scale reduced from 3.2 to 2.2.
-- PSM 6 fallback runs only when the first OCR pass is weak.
-- Tesseract availability detection is cached.
-
-For legacy behavior set `OCR_MODE=always`.
+The real PDF processing time depends on PDF structure and Render load/cold-start. On the fast path, backend parsing itself is designed to complete far below the old 15-second table-detection path.

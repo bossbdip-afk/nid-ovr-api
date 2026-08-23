@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.2.0"
+APP_VERSION = "14.3.0"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -294,6 +294,229 @@ def choose_text(raw: str, ocr: OcrCandidate) -> tuple[str, str, float]:
     return raw_clean, "pdf_text", 100.0
 
 
+
+
+# -------------------------- Ultra-fast text path --------------------------
+# PyMuPDF's table detector is accurate but expensive on Render's free/small
+# CPU. These NID PDFs already contain a positioned text layer, so extract from
+# that first. Table detection + OCR are kept only as a compatibility fallback
+# for unusual/scanned PDFs.
+
+def serial_meaningful(value: Any) -> bool:
+    s = clean_text(value)
+    if not meaningful(s):
+        return False
+    # Some PDFs expose a placeholder 0 in the detected table while the real
+    # serial is present in the positioned text layer. Never accept that as a
+    # real serial number.
+    return not bool(re.fullmatch(r"0+", s))
+
+
+def _word_lines(page: fitz.Page) -> list[dict[str, Any]]:
+    words = page.get_text("words", sort=True)
+    grouped: dict[tuple[int, int], list[tuple]] = {}
+    for w in words:
+        grouped.setdefault((int(w[5]), int(w[6])), []).append(w)
+    lines: list[dict[str, Any]] = []
+    for ws in grouped.values():
+        ws.sort(key=lambda x: x[0])
+        rect = fitz.Rect(ws[0][:4])
+        for w in ws[1:]:
+            rect |= fitz.Rect(w[:4])
+        lines.append({"words": ws, "rect": rect, "text": clean_text(" ".join(str(w[4]) for w in ws))})
+    lines.sort(key=lambda x: (x["rect"].y0, x["rect"].x0))
+    return lines
+
+
+def _match_label_words(words: list[tuple], label: str):
+    target = norm_label(label)
+    if not target:
+        return None
+    for i in range(len(words)):
+        acc = []
+        for j in range(i, min(len(words), i + 6)):
+            token = norm_label(words[j][4])
+            if token:
+                acc.append(token)
+            candidate = " ".join(acc)
+            if candidate == target or SequenceMatcher(None, candidate, target).ratio() >= 0.96:
+                return i, j
+            if len(candidate) > len(target) + 8:
+                break
+    return None
+
+
+def _join_value_words(words: list[tuple], start: int) -> str:
+    if start >= len(words):
+        return ""
+    out = []
+    prev_x1 = None
+    for w in words[start:]:
+        x0, _, x1, _, text = w[:5]
+        # Once a value has started, a large horizontal jump almost always means
+        # the next table column / label. Normal multi-word values have small gaps.
+        if out and prev_x1 is not None and (x0 - prev_x1) > 22:
+            break
+        out.append(str(text))
+        prev_x1 = x1
+    return clean_text(" ".join(out))
+
+
+def fast_value(page: fitz.Page, lines: list[dict[str, Any]], labels: Iterable[str], *, y_min: float | None = None, y_max: float | None = None) -> tuple[str, dict[str, Any]]:
+    for label in labels:
+        for idx, line in enumerate(lines):
+            r = line["rect"]
+            cy = (r.y0 + r.y1) / 2
+            if y_min is not None and cy < y_min:
+                continue
+            if y_max is not None and cy >= y_max:
+                continue
+            hit = _match_label_words(line["words"], label)
+            if not hit:
+                continue
+            _, j = hit
+            value = _join_value_words(line["words"], j + 1)
+            if meaningful(value):
+                return clean_bengali(value) if BENGALI_RE.search(value) else clean_text(value), {"source": "pdf_words_fast"}
+
+            # Label and value are often separate PDF text blocks on the same row.
+            label_rect = fitz.Rect(line["words"][hit[0]][:4])
+            for k in range(hit[0] + 1, j + 1):
+                label_rect |= fitz.Rect(line["words"][k][:4])
+            best = None
+            for other in lines:
+                if other is line:
+                    continue
+                orc = other["rect"]
+                ocy = (orc.y0 + orc.y1) / 2
+                if y_min is not None and ocy < y_min:
+                    continue
+                if y_max is not None and ocy >= y_max:
+                    continue
+                if orc.x0 <= label_rect.x1 + 1:
+                    continue
+                vertical_delta = abs(ocy - ((label_rect.y0 + label_rect.y1) / 2))
+                if vertical_delta > max(8.0, label_rect.height * 0.8):
+                    continue
+                score = (vertical_delta, orc.x0 - label_rect.x1)
+                if best is None or score < best[0]:
+                    best = (score, other)
+            if best is not None:
+                value = clean_text(best[1]["text"])
+                if meaningful(value):
+                    return clean_bengali(value) if BENGALI_RE.search(value) else value, {"source": "pdf_words_row_fast"}
+    return "", {"source": "missing"}
+
+
+def _section_y(lines: list[dict[str, Any]], labels: Iterable[str]) -> float | None:
+    for label in labels:
+        for line in lines:
+            if _match_label_words(line["words"], label):
+                r = line["rect"]
+                return (r.y0 + r.y1) / 2
+    return None
+
+
+def fast_address(page: fitz.Page, lines: list[dict[str, Any]], section: str, next_section: str | None) -> tuple[str, dict[str, Any]]:
+    start = _section_y(lines, [section])
+    if start is None:
+        return "", {"source": "missing"}
+    end = _section_y(lines, [next_section]) if next_section else None
+    y_min = start + 1
+    y_max = end
+
+    def fv(labels, bengali=True):
+        v, m = fast_value(page, lines, labels, y_min=y_min, y_max=y_max)
+        return (clean_bengali(v) if bengali else clean_text(v)), m
+
+    additional_village, m_add = fv(["Additional Village/Road"])
+    village, m_vil = fv(["Village/Road"])
+    holding, m_hold = fv(["Home/Holding No", "Home/Holding"], False)
+    post, m_post = fv(["Post Office", "Post Ofcfie"])
+    postal, m_postal = fv(["Postal Code", "Post Code"], False)
+    upazila, m_up = fv(["Upozila", "Upazila"])
+    district, m_dist = fv(["District"])
+
+    v = additional_village or village
+    if not meaningful(holding):
+        holding = ""
+    parts: list[str] = []
+    if v:
+        parts.append(f"গ্রাম/রাস্তা: {v}")
+    if holding:
+        parts.append(f"হোল্ডিং নং: {holding}")
+    if post:
+        parts.append("ডাকঘর: " + post + ((" - " + postal) if postal else ""))
+    elif postal:
+        parts.append("পোস্ট কোড: " + postal)
+    if upazila:
+        parts.append(upazila)
+    if district:
+        parts.append(district)
+    return clean_bengali(", ".join(parts)), {
+        "source": "pdf_words_fast", "village": m_add if additional_village else m_vil,
+        "holding": m_hold, "post": m_post, "postal": m_postal, "upazila": m_up, "district": m_dist,
+    }
+
+
+def extract_fast_text(doc: fitz.Document) -> tuple[dict[str, str], dict[str, Any], bool]:
+    p1 = doc[0]
+    l1 = _word_lines(p1)
+    fields: dict[str, str] = {}
+    debug: dict[str, Any] = {}
+    specs = {
+        "nid": ["National ID"],
+        "pin": ["Pin"],
+        "siNo": ["Sl No", "SI No", "SL No", "Serial No", "Serial Number", "S/L No"],
+        "voterNo": ["Voter No"],
+        "nameBn": ["Name(Bangla)"],
+        "nameEn": ["Name(English)"],
+        "dob": ["Date of Birth"],
+        "birthPlace": ["Birth Place"],
+        "father": ["Father Name"],
+        "mother": ["Mother Name"],
+        "spouse": ["Spouse Name"],
+        "gender": ["Gender"],
+    }
+    for key, labels in specs.items():
+        fields[key], debug[key] = fast_value(p1, l1, labels)
+
+    # A placeholder zero is not a serial number. Search the page text for the
+    # real value before any expensive table fallback.
+    if not serial_meaningful(fields.get("siNo")):
+        fields["siNo"] = ""
+        page_text = clean_text(p1.get_text("text"))
+        for pat in (
+            r"(?:S\s*/\s*L|SL|Sl|SI|Serial)\s*\.?\s*(?:No|Number)\s*[:#.-]?\s*([A-Za-z0-9/-]{1,})",
+            r"(?:ক্রমিক|সিরিয়াল)\s*(?:নং|নম্বর)?\s*[:#.-]?\s*([A-Za-z0-9০-৯/-]{1,})",
+        ):
+            for m in re.finditer(pat, page_text, flags=re.IGNORECASE):
+                if serial_meaningful(m.group(1)):
+                    fields["siNo"] = clean_text(m.group(1))
+                    debug["siNo"] = {"source": "pdf_text_serial_fast"}
+                    break
+            if serial_meaningful(fields.get("siNo")):
+                break
+
+    fields["presentAddress"], debug["presentAddress"] = fast_address(p1, l1, "Present Address", "Permanent Address")
+    fields["permanentAddress"], debug["permanentAddress"] = fast_address(p1, l1, "Permanent Address", "Foreign Address")
+
+    if doc.page_count > 1:
+        p2 = doc[1]
+        l2 = _word_lines(p2)
+        fields["religion"], debug["religion"] = fast_value(p2, l2, ["Religion"])
+        fields["voterArea"], debug["voterArea"] = fast_value(p2, l2, ["Voter Area"])
+    else:
+        fields["religion"] = fields["voterArea"] = ""
+        debug["religion"] = debug["voterArea"] = {"source": "missing"}
+
+    # Require the core identity rows before trusting the no-table fast path.
+    core = ["nid", "pin", "voterNo", "nameBn", "nameEn", "dob", "father", "mother", "gender"]
+    found = sum(1 for k in core if meaningful(fields.get(k)))
+    usable = found >= 7 and meaningful(fields.get("nid")) and meaningful(fields.get("voterNo"))
+    return fields, debug, usable
+
+
 # ------------------------------ Table helpers ------------------------------
 
 def norm_label(value: Any) -> str:
@@ -471,6 +694,41 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     if doc.page_count < 1:
         raise ValueError("PDF-এ কোনো page নেই।")
 
+    # Fast path: positioned text extraction normally completes in milliseconds
+    # and avoids the 10-15 second find_tables() cost seen on Render.
+    fields, debug, usable = extract_fast_text(doc)
+    if usable:
+        for k, v in list(fields.items()):
+            if k in {"nameBn", "father", "mother", "spouse", "birthPlace", "voterArea", "presentAddress", "permanentAddress"}:
+                fields[k] = clean_bengali(v)
+            else:
+                fields[k] = clean_text(v)
+        return {
+            "ok": True,
+            "engine": "python-pymupdf-fast-text-v14.3",
+            "version": APP_VERSION,
+            "ocr_available": tesseract_available(),
+            "pages": doc.page_count,
+            "fields": fields,
+            "debug": debug,
+        }
+
+    # Compatibility fallback for PDFs whose text layer is missing or unusually
+    # structured. This retains the previous table/OCR behavior.
+    doc.close()
+    result = extract_document_table_fallback(pdf_bytes)
+    result["engine"] = "python-pymupdf-table-fallback-v14.3"
+    return result
+
+
+def extract_document_table_fallback(pdf_bytes: bytes) -> dict[str, Any]:
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        raise ValueError(f"PDF খোলা যায়নি: {e}") from e
+    if doc.page_count < 1:
+        raise ValueError("PDF-এ কোনো page নেই।")
+
     p1 = doc[0]
     t1 = get_table(p1)
     if t1 is None:
@@ -504,17 +762,19 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     # Some NID PDFs expose the serial label outside the detected table or split
     # the label/value into separate text spans. If the normal table lookup did
     # not find it, use the embedded text layer as a cheap fallback (no OCR).
-    if not meaningful(fields.get("siNo")):
+    if not serial_meaningful(fields.get("siNo")):
         page_text = clean_text(p1.get_text("text"))
         serial_patterns = [
             r"(?:S\s*/\s*L|SL|Sl|SI|Serial)\s*\.?\s*(?:No|Number)\s*[:#.-]?\s*([A-Za-z0-9/-]{2,})",
             r"(?:ক্রমিক|সিরিয়াল)\s*(?:নং|নম্বর)?\s*[:#.-]?\s*([A-Za-z0-9০-৯/-]{2,})",
         ]
         for pat in serial_patterns:
-            m = re.search(pat, page_text, flags=re.IGNORECASE)
-            if m:
-                fields["siNo"] = clean_text(m.group(1))
-                debug["siNo"] = {"source": "pdf_text_fallback"}
+            for m in re.finditer(pat, page_text, flags=re.IGNORECASE):
+                if serial_meaningful(m.group(1)):
+                    fields["siNo"] = clean_text(m.group(1))
+                    debug["siNo"] = {"source": "pdf_text_fallback"}
+                    break
+            if serial_meaningful(fields.get("siNo")):
                 break
 
     fields["presentAddress"], debug["presentAddress"] = build_address(p1, t1, "Present Address", "Permanent Address")
@@ -539,7 +799,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.1",
+        "engine": "python-pymupdf-fast-text-v14.3",
         "version": APP_VERSION,
         "ocr_available": tesseract_available(),
         "pages": doc.page_count,
@@ -552,7 +812,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 def root() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.1",
+        "engine": "python-pymupdf-fast-text-v14.3",
         "version": APP_VERSION,
         "message": "NID Bengali OCR API is running. Use /health or POST /extract.",
     }
@@ -562,7 +822,7 @@ def root() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.1",
+        "engine": "python-pymupdf-fast-text-v14.3",
         "version": APP_VERSION,
         "pymupdf": fitz.VersionBind,
         "tesseract": tesseract_available(),
