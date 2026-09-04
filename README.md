@@ -39,3 +39,9 @@ Optional environment variables:
 
 
 Signature fix v14.3.3: single active frontend processPDF flow, backend /SMask extraction, and rendered-crop fallback below the portrait when an embedded signature image is not directly decodable.
+
+
+## Signature extraction fix (v14.3.4)
+- Portrait detection no longer assumes the image is on the left side of the page.
+- Signature is selected by its actual PDF XObject placement directly below the detected portrait.
+- Fixed page-coordinate signature cropping was removed to prevent table text from being shown as a signature.

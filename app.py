@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.3.3-signature-crop"
+APP_VERSION = "14.3.4-signature-xobject"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -501,15 +501,14 @@ def _pixmap_png_data_url(doc: fitz.Document, xref: int, smask: int = 0) -> str:
 
 
 def extract_cardholder_signature(doc: fitz.Document, page: fitz.Page) -> tuple[str, dict[str, Any]]:
-    """Extract the card-holder signature image from page 1.
+    """Extract the card-holder signature from page 1 without fixed page crops.
 
-    These PDFs usually store the portrait and signature as separate image XObjects.
-    The signature can be a transparent image with an /SMask, so simply scanning for
-    JPEG byte markers misses it.  We identify the portrait on the left half of the
-    page, then select a wide image placed immediately below it and rebuild the mask.
+    The supplied PDF family places a portrait image and a separate wide signature
+    image on the same side of the page. The signature may use an /SMask, so it is
+    reconstructed from the PDF XObject + mask. Detection is position-based relative
+    to the actual portrait rectangle, not hard-coded left/right page coordinates.
     """
     items: list[dict[str, Any]] = []
-    page_mid = page.rect.width / 2
     for raw in page.get_images(full=True):
         xref, smask, w, h = int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3])
         if w <= 0 or h <= 0:
@@ -519,20 +518,27 @@ def extract_cardholder_signature(doc: fitz.Document, page: fitz.Page) -> tuple[s
         except Exception:
             rects = []
         for rect in rects:
-            if rect.is_empty or rect.is_infinite:
+            if rect.is_empty or rect.is_infinite or rect.width <= 0 or rect.height <= 0:
                 continue
             items.append({
-                "xref": xref, "smask": smask, "w": w, "h": h, "rect": rect,
-                "pixel_ratio": w / h,
+                "xref": xref,
+                "smask": smask,
+                "w": w,
+                "h": h,
+                "rect": rect,
+                "pixel_ratio": w / max(h, 1),
                 "placed_ratio": rect.width / max(rect.height, 0.01),
             })
 
+    # Portrait: tall image, reasonably sized, and in the upper part of page.
+    # Do not assume it is on the left: the supplied NIDFN PDFs place it on the right.
     portraits = [
         it for it in items
         if it["h"] > it["w"] * 1.08
-        and it["rect"].x0 < page_mid
-        and it["rect"].height >= 25
-        and it["rect"].width >= 20
+        and it["rect"].height >= 45
+        and it["rect"].width >= 30
+        and it["rect"].y0 < page.rect.height * 0.55
+        and it["rect"].get_area() < page.rect.get_area() * 0.20
     ]
     portraits.sort(key=lambda it: it["rect"].get_area(), reverse=True)
     portrait = portraits[0] if portraits else None
@@ -544,33 +550,42 @@ def extract_cardholder_signature(doc: fitz.Document, page: fitz.Page) -> tuple[s
     candidates: list[tuple[float, dict[str, Any]]] = []
     for it in items:
         r = it["rect"]
-        if r.x0 >= page_mid:
+        # Signature must be wide/short both in intrinsic pixels and on-page placement.
+        if it["pixel_ratio"] < 2.0 or it["placed_ratio"] < 2.0:
             continue
-        if it["pixel_ratio"] < 1.8 or it["placed_ratio"] < 1.8:
+        if r.height > 55 or r.width < 35:
             continue
-        if r.height > 45 or r.width < 20:
+        if r.get_area() > page.rect.get_area() * 0.05:
             continue
+
         score = 0.0
         if portrait is not None:
             pr = portrait["rect"]
             gap = r.y0 - pr.y1
-            if gap < -5 or gap > 65:
+            # Signature is directly below portrait in this PDF family.
+            if gap < -4 or gap > max(95.0, pr.height * 0.75):
                 continue
             ov = overlap_x(r, pr)
-            if ov < 0.35:
+            if ov < 0.55:
                 continue
-            score += 100 - abs(gap) * 1.5 + ov * 30
-            score -= abs(r.x0 - pr.x0) * 0.4
+            # Prefer same width / x-position as portrait and a small vertical gap.
+            center_delta = abs((r.x0 + r.x1) / 2 - (pr.x0 + pr.x1) / 2)
+            width_delta = abs(r.width - pr.width)
+            score += 160.0
+            score -= abs(gap) * 1.6
+            score += ov * 45.0
+            score -= center_delta * 0.8
+            score -= width_delta * 0.25
         else:
-            # Conservative fallback for one-page card PDFs: small, wide image in
-            # the upper-left quadrant, where the holder signature normally sits.
-            if r.y0 > page.rect.height * 0.45:
+            # Conservative no-portrait fallback: wide small XObject in upper half.
+            if r.y0 > page.rect.height * 0.55:
                 continue
-            score += 20 - r.y0 * 0.02
+            score += 10.0 - r.y0 * 0.005
+
         if it["smask"]:
-            score += 12
-        if 2.5 <= it["pixel_ratio"] <= 6.0:
-            score += 8
+            score += 30.0
+        if 2.5 <= it["pixel_ratio"] <= 6.5:
+            score += 12.0
         candidates.append((score, it))
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
@@ -579,39 +594,26 @@ def extract_cardholder_signature(doc: fitz.Document, page: fitz.Page) -> tuple[s
         data_url = _pixmap_png_data_url(doc, best["xref"], best["smask"])
         if data_url:
             r = best["rect"]
-            return data_url, {
+            debug = {
                 "source": "pdf_image_xobject",
                 "xref": best["xref"],
                 "smask": best["smask"],
                 "pixelSize": [best["w"], best["h"]],
                 "rect": [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)],
             }
+            if portrait is not None:
+                pr = portrait["rect"]
+                debug["portraitRect"] = [round(pr.x0, 2), round(pr.y0, 2), round(pr.x1, 2), round(pr.y1, 2)]
+            return data_url, debug
 
-    # Last-resort visual fallback: render a small strip immediately below the
-    # portrait. This catches signatures that are flattened into page graphics or
-    # represented in a way PDF image-object extraction cannot decode.
+    # Deliberately do not use a fixed page-coordinate crop. A wrong crop can show
+    # table labels as a fake signature. If no trustworthy signature XObject is found,
+    # return missing so the UI can clearly report that instead of displaying bad data.
+    debug: dict[str, Any] = {"source": "missing"}
     if portrait is not None:
         pr = portrait["rect"]
-        clip = fitz.Rect(
-            max(page.rect.x0, pr.x0 - 4),
-            max(page.rect.y0, pr.y1 + 1),
-            min(page.rect.x1, pr.x1 + 4),
-            min(page.rect.y1, pr.y1 + max(18, pr.height * 0.38)),
-        )
-        if clip.width >= 20 and clip.height >= 8:
-            try:
-                pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=clip, alpha=False)
-                png = pix.tobytes("png")
-                return "data:image/png;base64," + base64.b64encode(png).decode("ascii"), {
-                    "source": "rendered_crop_fallback",
-                    "rect": [round(clip.x0, 2), round(clip.y0, 2), round(clip.x1, 2), round(clip.y1, 2)],
-                    "pixelSize": [pix.width, pix.height],
-                }
-            except Exception as exc:
-                return "", {"source": "crop_failed", "error": str(exc)}
-
-    return "", {"source": "missing"}
-
+        debug["portraitRect"] = [round(pr.x0, 2), round(pr.y0, 2), round(pr.x1, 2), round(pr.y1, 2)]
+    return "", debug
 
 
 def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
