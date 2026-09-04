@@ -21,3 +21,5 @@ services:
         value: "1"
       - key: EXTRACT_TIMEOUT_SECONDS
         value: "120"
+      - key: MAX_TEMPLATE_BYTES
+        value: "10485760"
