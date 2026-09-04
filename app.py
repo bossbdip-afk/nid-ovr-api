@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.3.4-signature-xobject"
+APP_VERSION = "14.3.5-fingerprint-xobject"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -341,45 +341,59 @@ def get_table(page: fitz.Page):
 
 
 def find_simple_row(table, labels: Iterable[str], data=None):
+    """Find a label in any table column and return (row_index, row, label_col).
+
+    Older PDFs put labels in column 0; the supplied ``old`` PDF has a leading
+    blank column and puts the same labels in column 1.  Searching every cell
+    keeps both layouts working without a document-specific offset.
+    """
     if table is None:
         return None
     if data is None:
         data = table.extract()
     wanted = [norm_label(x) for x in labels]
-    # Exact normalized labels first. This prevents Father Name from ever being
-    # accepted for Mother Name just because the strings are similar.
     for ri, row in enumerate(data):
         if not row:
             continue
-        actual = norm_label(row[0] if len(row) > 0 else "")
-        if actual and actual in wanted:
-            return ri, row
-    # Fuzzy fallback is only for genuine extraction typos (e.g. Post Ofcfie).
+        for ci, cell in enumerate(row):
+            actual = norm_label(cell)
+            if actual and actual in wanted:
+                return ri, row, ci
     for ri, row in enumerate(data):
         if not row:
             continue
-        actual = row[0] if len(row) > 0 else ""
-        for label in labels:
-            if label_match(actual, label, 0.90):
-                return ri, row
+        for ci, cell in enumerate(row):
+            if not norm_label(cell):
+                continue
+            for label in labels:
+                if label_match(cell, label, 0.90):
+                    return ri, row, ci
     return None
-
 
 def simple_value(page: fitz.Page, table, labels: Iterable[str], *, ocr_bengali: bool = False, data=None) -> tuple[str, dict[str, Any]]:
     found = find_simple_row(table, labels, data=data)
     if not found:
         return "", {"source": "missing"}
-    ri, row = found
-    raw = row[1] if len(row) > 1 and row[1] is not None else ""
+    ri, row, li = found
+    vi = li + 1
+    raw = row[vi] if vi < len(row) and row[vi] is not None else ""
     raw_clean = clean_bengali(raw) if BENGALI_RE.search(str(raw or "")) else clean_text(raw)
     if not ocr_bengali or not BENGALI_RE.search(str(raw or "")):
         return raw_clean, {"source": "pdf_table"}
     if not should_run_ocr(raw):
         return raw_clean, {"source": "pdf_table_fast"}
-    cell = table.rows[ri].cells[1] if len(table.rows[ri].cells) > 1 else None
+    cell = table.rows[ri].cells[vi] if vi < len(table.rows[ri].cells) else None
     ocr = ocr_cell(page, cell)
     value, source, conf = choose_text(str(raw or ""), ocr)
     return value, {"source": source, "ocr_confidence": round(conf, 1), "raw": clean_text(raw), "ocr": ocr.text}
+
+def _row_label_col(row, wanted: str, threshold: float = 0.84):
+    if not row:
+        return None
+    for ci, cell in enumerate(row):
+        if label_match(cell, wanted, threshold):
+            return ci
+    return None
 
 
 def address_rows(table, section: str, next_section: str | None, data=None):
@@ -390,15 +404,14 @@ def address_rows(table, section: str, next_section: str | None, data=None):
     start = None
     end = len(data)
     for i, row in enumerate(data):
-        if row and len(row) > 0 and label_match(row[0], section, 0.84):
+        if _row_label_col(row, section, 0.84) is not None:
             start = i
             break
     if start is None:
         return []
     if next_section:
         for i in range(start + 1, len(data)):
-            row = data[i]
-            if row and len(row) > 0 and label_match(row[0], next_section, 0.84):
+            if _row_label_col(data[i], next_section, 0.84) is not None:
                 end = i
                 break
     return list(range(start, end))
@@ -407,21 +420,20 @@ def address_rows(table, section: str, next_section: str | None, data=None):
 def address_field(page: fitz.Page, table, row_indices: list[int], labels: list[str], *, ocr_bengali: bool = True, data=None) -> tuple[str, dict[str, Any]]:
     if data is None:
         data = table.extract() if table else []
-    # Address rows have two label/value pairs: columns 1/2 and 3/4.
     wanted = [norm_label(x) for x in labels]
     candidates = []
     for ri in row_indices:
         row = data[ri]
-        for li, vi in ((1, 2), (3, 4)):
-            if li >= len(row):
-                continue
-            actual = row[li]
+        # Search every cell for a label and use the immediately following cell
+        # as its value. This supports both 5-column and leading-blank 7-column forms.
+        for li, actual in enumerate(row):
             an = norm_label(actual)
             if not an:
                 continue
             exact = an in wanted
             fuzzy = any(label_match(actual, label, 0.90) for label in labels)
             if exact or fuzzy:
+                vi = li + 1
                 candidates.append((0 if exact else 1, ri, li, vi, row))
     candidates.sort(key=lambda x: x[0])
     for _, ri, li, vi, row in candidates:
@@ -438,7 +450,6 @@ def address_field(page: fitz.Page, table, row_indices: list[int], labels: list[s
         value, source, conf = choose_text(str(raw or ""), ocr)
         return value, {"source": source, "ocr_confidence": round(conf, 1), "raw": clean_text(raw), "ocr": ocr.text}
     return "", {"source": "missing"}
-
 
 def build_address(page: fitz.Page, table, section: str, next_section: str | None, data=None) -> tuple[str, dict[str, Any]]:
     rows = address_rows(table, section, next_section, data=data)
@@ -616,6 +627,76 @@ def extract_cardholder_signature(doc: fitz.Document, page: fitz.Page) -> tuple[s
     return "", debug
 
 
+
+def extract_cardholder_fingerprint(doc: fitz.Document, page: fitz.Page) -> tuple[str, dict[str, Any]]:
+    """Extract a fingerprint image placed below the portrait on page 1.
+
+    Signature detection remains separate. Fingerprints in the supplied old-format
+    PDF are near-square / portrait-ish image XObjects, while signatures are wide.
+    """
+    items: list[dict[str, Any]] = []
+    for raw in page.get_images(full=True):
+        xref, smask, w, h = int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3])
+        if w <= 0 or h <= 0:
+            continue
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception:
+            rects = []
+        for rect in rects:
+            if rect.is_empty or rect.is_infinite or rect.width <= 0 or rect.height <= 0:
+                continue
+            items.append({"xref":xref,"smask":smask,"w":w,"h":h,"rect":rect,
+                          "pixel_ratio":w/max(h,1),"placed_ratio":rect.width/max(rect.height,0.01)})
+
+    portraits = [it for it in items if it["h"] > it["w"]*1.08 and it["rect"].height >= 45
+                 and it["rect"].width >= 30 and it["rect"].y0 < page.rect.height*0.55
+                 and it["rect"].get_area() < page.rect.get_area()*0.20]
+    portraits.sort(key=lambda it: it["rect"].get_area(), reverse=True)
+    portrait = portraits[0] if portraits else None
+    if portrait is None:
+        return "", {"source":"missing","reason":"portrait_not_found"}
+
+    pr=portrait["rect"]
+    def overlap_x(a,b):
+        inter=max(0.0,min(a.x1,b.x1)-max(a.x0,b.x0))
+        return inter/max(1.0,min(a.width,b.width))
+
+    candidates=[]
+    for it in items:
+        if it["xref"] == portrait["xref"]:
+            continue
+        r=it["rect"]
+        # Fingerprint is not a wide signature: accept near-square / portrait-ish.
+        if not (0.55 <= it["pixel_ratio"] <= 1.45 and 0.50 <= it["placed_ratio"] <= 1.45):
+            continue
+        gap=r.y0-pr.y1
+        if gap < -4 or gap > max(125.0,pr.height*1.05):
+            continue
+        ov=overlap_x(r,pr)
+        if ov < 0.55:
+            continue
+        if r.get_area() > page.rect.get_area()*0.08:
+            continue
+        center_delta=abs((r.x0+r.x1)/2-(pr.x0+pr.x1)/2)
+        width_delta=abs(r.width-pr.width)
+        score=150.0-abs(gap)*1.1+ov*45.0-center_delta*0.8-width_delta*0.18
+        # Fingerprints tend to have substantial height and no soft mask requirement.
+        if r.height >= pr.height*0.55: score += 15.0
+        candidates.append((score,it))
+    candidates.sort(key=lambda x:x[0], reverse=True)
+    if not candidates:
+        return "", {"source":"missing","portraitRect":[round(pr.x0,2),round(pr.y0,2),round(pr.x1,2),round(pr.y1,2)]}
+    best=candidates[0][1]
+    data_url=_pixmap_png_data_url(doc,best["xref"],best["smask"])
+    if not data_url:
+        return "", {"source":"missing","reason":"image_decode_failed"}
+    r=best["rect"]
+    return data_url,{"source":"pdf_image_xobject","xref":best["xref"],"smask":best["smask"],
+                     "pixelSize":[best["w"],best["h"]],
+                     "rect":[round(r.x0,2),round(r.y0,2),round(r.x1,2),round(r.y1,2)],
+                     "portraitRect":[round(pr.x0,2),round(pr.y0,2),round(pr.x1,2),round(pr.y1,2)]}
+
 def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -626,6 +707,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 
     p1 = doc[0]
     signature_data_url, signature_debug = extract_cardholder_signature(doc, p1)
+    fingerprint_data_url, fingerprint_debug = extract_cardholder_fingerprint(doc, p1)
     t1 = get_table(p1)
     if t1 is None:
         raise ValueError("প্রথম page-এর NID table শনাক্ত করা যায়নি।")
@@ -707,7 +789,8 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
         "pages": doc.page_count,
         "fields": fields,
         "signatureDataUrl": signature_data_url,
-        "debug": {**debug, "signature": signature_debug},
+        "fingerprintDataUrl": fingerprint_data_url,
+        "debug": {**debug, "signature": signature_debug, "fingerprint": fingerprint_debug},
     }
 
 
@@ -787,7 +870,7 @@ async def save_template_mapping(request: Request, mapping: dict[str, Any] = Body
     require_template_admin(request)
     if not isinstance(mapping, dict) or not mapping:
         raise HTTPException(status_code=400, detail="Mapping খালি হতে পারবে না।")
-    allowed = {"photo","signature","nameBn","nameEn","father","mother","dob","nid","presentAddress","birthPlace","bloodGroup","issueDate","barcode"}
+    allowed = {"photo","signature","fingerprint","nameBn","nameEn","father","mother","dob","nid","presentAddress","birthPlace","bloodGroup","issueDate","barcode"}
     clean: dict[str, Any] = {}
     for field, cfg in mapping.items():
         if field not in allowed or not isinstance(cfg, dict):

@@ -45,3 +45,9 @@ Signature fix v14.3.3: single active frontend processPDF flow, backend /SMask ex
 - Portrait detection no longer assumes the image is on the left side of the page.
 - Signature is selected by its actual PDF XObject placement directly below the detected portrait.
 - Fixed page-coordinate signature cropping was removed to prevent table text from being shown as a signature.
+
+
+## Fingerprint extraction fix (v14.3.5)
+- `/extract` returns `fingerprintDataUrl` when a near-square fingerprint image XObject is placed below the portrait.
+- Signature extraction remains unchanged and separate.
+- Table parsing now supports PDFs with a leading blank column, so old-format forms still return identity/address fields.
