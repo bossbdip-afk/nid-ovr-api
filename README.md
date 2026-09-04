@@ -30,3 +30,9 @@ Optional environment variables:
 - `TEMPLATE_DATA_DIR` - directory used to store template + mapping
 - `MAX_TEMPLATE_BYTES` - maximum template PDF size (default 10 MB)
 - Existing OCR variables in `render.yaml` remain supported.
+
+## Signature extraction fix (v14.3.2)
+- `/extract` now returns `signatureDataUrl` when the card-holder signature is stored as a PDF image XObject.
+- Transparent signatures that use an `/SMask` are reconstructed as PNG instead of being missed by JPEG scanning.
+- The candidate is selected from the wide image placed directly below the portrait on page 1.
+

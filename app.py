@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -23,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.3.1"
+APP_VERSION = "14.3.2-signature"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -481,6 +482,115 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
     return clean_bengali(", ".join(parts)), meta
 
 
+
+
+def _pixmap_png_data_url(doc: fitz.Document, xref: int, smask: int = 0) -> str:
+    """Return a PNG data URL for a PDF image, rebuilding its soft mask when present."""
+    try:
+        pix = fitz.Pixmap(doc, xref)
+        if smask:
+            mask = fitz.Pixmap(doc, smask)
+            pix = fitz.Pixmap(pix, mask)
+        # Keep alpha, but normalize non-RGB color spaces so browsers render it reliably.
+        if pix.colorspace is not None and pix.colorspace.n > 3:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        png = pix.tobytes("png")
+        return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    except Exception:
+        return ""
+
+
+def extract_cardholder_signature(doc: fitz.Document, page: fitz.Page) -> tuple[str, dict[str, Any]]:
+    """Extract the card-holder signature image from page 1.
+
+    These PDFs usually store the portrait and signature as separate image XObjects.
+    The signature can be a transparent image with an /SMask, so simply scanning for
+    JPEG byte markers misses it.  We identify the portrait on the left half of the
+    page, then select a wide image placed immediately below it and rebuild the mask.
+    """
+    items: list[dict[str, Any]] = []
+    page_mid = page.rect.width / 2
+    for raw in page.get_images(full=True):
+        xref, smask, w, h = int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3])
+        if w <= 0 or h <= 0:
+            continue
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception:
+            rects = []
+        for rect in rects:
+            if rect.is_empty or rect.is_infinite:
+                continue
+            items.append({
+                "xref": xref, "smask": smask, "w": w, "h": h, "rect": rect,
+                "pixel_ratio": w / h,
+                "placed_ratio": rect.width / max(rect.height, 0.01),
+            })
+
+    portraits = [
+        it for it in items
+        if it["h"] > it["w"] * 1.08
+        and it["rect"].x0 < page_mid
+        and it["rect"].height >= 25
+        and it["rect"].width >= 20
+    ]
+    portraits.sort(key=lambda it: it["rect"].get_area(), reverse=True)
+    portrait = portraits[0] if portraits else None
+
+    def overlap_x(a: fitz.Rect, b: fitz.Rect) -> float:
+        inter = max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
+        return inter / max(1.0, min(a.width, b.width))
+
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for it in items:
+        r = it["rect"]
+        if r.x0 >= page_mid:
+            continue
+        if it["pixel_ratio"] < 1.8 or it["placed_ratio"] < 1.8:
+            continue
+        if r.height > 45 or r.width < 20:
+            continue
+        score = 0.0
+        if portrait is not None:
+            pr = portrait["rect"]
+            gap = r.y0 - pr.y1
+            if gap < -5 or gap > 65:
+                continue
+            ov = overlap_x(r, pr)
+            if ov < 0.35:
+                continue
+            score += 100 - abs(gap) * 1.5 + ov * 30
+            score -= abs(r.x0 - pr.x0) * 0.4
+        else:
+            # Conservative fallback for one-page card PDFs: small, wide image in
+            # the upper-left quadrant, where the holder signature normally sits.
+            if r.y0 > page.rect.height * 0.45:
+                continue
+            score += 20 - r.y0 * 0.02
+        if it["smask"]:
+            score += 12
+        if 2.5 <= it["pixel_ratio"] <= 6.0:
+            score += 8
+        candidates.append((score, it))
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    if not candidates:
+        return "", {"source": "missing"}
+
+    best = candidates[0][1]
+    data_url = _pixmap_png_data_url(doc, best["xref"], best["smask"])
+    if not data_url:
+        return "", {"source": "decode_failed", "xref": best["xref"]}
+    r = best["rect"]
+    return data_url, {
+        "source": "pdf_image_xobject",
+        "xref": best["xref"],
+        "smask": best["smask"],
+        "pixelSize": [best["w"], best["h"]],
+        "rect": [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)],
+    }
+
+
 def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -490,6 +600,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
         raise ValueError("PDF-এ কোনো page নেই।")
 
     p1 = doc[0]
+    signature_data_url, signature_debug = extract_cardholder_signature(doc, p1)
     t1 = get_table(p1)
     if t1 is None:
         raise ValueError("প্রথম page-এর NID table শনাক্ত করা যায়নি।")
@@ -565,12 +676,13 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.3",
+        "engine": "python-pymupdf-visual-ocr-v14.3.2",
         "version": APP_VERSION,
         "ocr_available": tesseract_available(),
         "pages": doc.page_count,
         "fields": fields,
-        "debug": debug,
+        "signatureDataUrl": signature_data_url,
+        "debug": {**debug, "signature": signature_debug},
     }
 
 
@@ -578,7 +690,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 def root() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.3",
+        "engine": "python-pymupdf-visual-ocr-v14.3.2",
         "version": APP_VERSION,
         "message": "NID Bengali OCR API is running. Use /health or POST /extract.",
     }
@@ -588,7 +700,7 @@ def root() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.3",
+        "engine": "python-pymupdf-visual-ocr-v14.3.2",
         "version": APP_VERSION,
         "pymupdf": fitz.VersionBind,
         "tesseract": tesseract_available(),
