@@ -1,32 +1,36 @@
-# SB Tech Info OCR Backend - Checked Build 14.3.1
+# SBTechInfo NID Bengali OCR API
 
-FastAPI backend for PDF field extraction and the template-mapping workflow.
+FastAPI + PyMuPDF + Tesseract Bengali OCR service.
 
-## Main endpoints
+Endpoints:
+- `GET /` status
+- `GET /health` health check
+- `POST /extract` multipart PDF field extraction
 
-- `GET /health` - service health
-- `POST /extract` - extract fields from the uploaded source PDF
-- `GET /template/config` - get saved template status + mapping
-- `GET /template/pdf` - download the currently saved blank template
-- `POST /template/pdf` - upload/replace blank PDF template
-- `POST /template/mapping` - save visual field mapping
-- `DELETE /template/config` - clear saved template + mapping
+This repo includes `render.yaml` and a Dockerfile for Render deployment.
 
-## Mapping fields
+## v14.1 performance update
+- Default `OCR_MODE=auto`: clean Bengali text from the PDF layer skips Tesseract.
+- OCR runs only for visibly damaged Bengali text.
+- OCR scale reduced from 3.2 to 2.2.
+- PSM 6 fallback runs only when the first OCR pass is weak.
+- Tesseract availability detection is cached.
 
-`photo`, `signature`, `nameBn`, `nameEn`, `father`, `mother`, `dob`, `nid`, `presentAddress`, `birthPlace`, `bloodGroup`, `issueDate`, `barcode`.
+For legacy behavior set `OCR_MODE=always`.
 
-The 2D barcode itself is rendered by the frontend from extracted `nameEn`, `dob`, and `pin` data. The backend returns the extracted `pin` field through `/extract`.
+## v14.3 template mapping update
+Additional template endpoints:
+- `GET /template/config`
+- `GET /template/pdf`
+- `POST /template/pdf`
+- `POST /template/mapping`
+- `DELETE /template/config`
 
-## Render / Docker
-
-The repository root should contain exactly the normal deploy files, including a file named **`Dockerfile`** (no `.txt` extension).
-
-Template files are stored under `TEMPLATE_DATA_DIR` (default `./data`). Render's normal local filesystem is ephemeral, so uploaded templates can disappear after restart/redeploy unless a persistent disk is configured. The frontend also has its browser-side fallback.
+New extraction field: `bloodGroup`.
 
 Optional environment variables:
+- `ADMIN_TEMPLATE_KEY`: when set, template write/delete endpoints require `X-Admin-Key`.
+- `TEMPLATE_DATA_DIR`: directory used to store `card-template.pdf` and `card-mapping.json`.
+- `MAX_TEMPLATE_BYTES`: upload size limit for the blank template PDF.
 
-- `ADMIN_TEMPLATE_KEY` - protects template upload/mapping/delete endpoints via `X-Admin-Key`
-- `TEMPLATE_DATA_DIR` - directory used to store template + mapping
-- `MAX_TEMPLATE_BYTES` - maximum template PDF size (default 10 MB)
-- Existing OCR variables in `render.yaml` remain supported.
+Render note: local filesystem is ephemeral unless persistent disk storage is configured.

@@ -23,7 +23,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.3.1"
+APP_VERSION = "14.3.0"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -68,7 +68,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -565,7 +565,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.3",
+        "engine": "python-pymupdf-visual-ocr-v14.1",
         "version": APP_VERSION,
         "ocr_available": tesseract_available(),
         "pages": doc.page_count,
@@ -578,7 +578,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
 def root() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.3",
+        "engine": "python-pymupdf-visual-ocr-v14.1",
         "version": APP_VERSION,
         "message": "NID Bengali OCR API is running. Use /health or POST /extract.",
     }
@@ -588,7 +588,7 @@ def root() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "engine": "python-pymupdf-visual-ocr-v14.3",
+        "engine": "python-pymupdf-visual-ocr-v14.1",
         "version": APP_VERSION,
         "pymupdf": fitz.VersionBind,
         "tesseract": tesseract_available(),
@@ -632,13 +632,6 @@ async def upload_template_pdf(request: Request, file: UploadFile = File(...)) ->
         raise HTTPException(status_code=413, detail="Template PDF size limit-এর চেয়ে বড়।")
     if not data.startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="Template ফাইলটি valid PDF নয়।")
-    try:
-        check_doc = fitz.open(stream=data, filetype="pdf")
-        if check_doc.page_count < 1:
-            raise ValueError("empty PDF")
-        check_doc.close()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Template PDF খোলা যাচ্ছে না বা corrupt।") from e
     tmp = TEMPLATE_PDF_PATH.with_suffix(".tmp")
     tmp.write_bytes(data)
     tmp.replace(TEMPLATE_PDF_PATH)
