@@ -36,3 +36,6 @@ Optional environment variables:
 - Transparent signatures that use an `/SMask` are reconstructed as PNG instead of being missed by JPEG scanning.
 - The candidate is selected from the wide image placed directly below the portrait on page 1.
 
+
+
+Signature fix v14.3.3: single active frontend processPDF flow, backend /SMask extraction, and rendered-crop fallback below the portrait when an embedded signature image is not directly decodable.

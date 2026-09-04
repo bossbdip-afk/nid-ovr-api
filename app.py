@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.3.2-signature"
+APP_VERSION = "14.3.3-signature-crop"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -574,21 +574,44 @@ def extract_cardholder_signature(doc: fitz.Document, page: fitz.Page) -> tuple[s
         candidates.append((score, it))
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    if not candidates:
-        return "", {"source": "missing"}
+    if candidates:
+        best = candidates[0][1]
+        data_url = _pixmap_png_data_url(doc, best["xref"], best["smask"])
+        if data_url:
+            r = best["rect"]
+            return data_url, {
+                "source": "pdf_image_xobject",
+                "xref": best["xref"],
+                "smask": best["smask"],
+                "pixelSize": [best["w"], best["h"]],
+                "rect": [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)],
+            }
 
-    best = candidates[0][1]
-    data_url = _pixmap_png_data_url(doc, best["xref"], best["smask"])
-    if not data_url:
-        return "", {"source": "decode_failed", "xref": best["xref"]}
-    r = best["rect"]
-    return data_url, {
-        "source": "pdf_image_xobject",
-        "xref": best["xref"],
-        "smask": best["smask"],
-        "pixelSize": [best["w"], best["h"]],
-        "rect": [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)],
-    }
+    # Last-resort visual fallback: render a small strip immediately below the
+    # portrait. This catches signatures that are flattened into page graphics or
+    # represented in a way PDF image-object extraction cannot decode.
+    if portrait is not None:
+        pr = portrait["rect"]
+        clip = fitz.Rect(
+            max(page.rect.x0, pr.x0 - 4),
+            max(page.rect.y0, pr.y1 + 1),
+            min(page.rect.x1, pr.x1 + 4),
+            min(page.rect.y1, pr.y1 + max(18, pr.height * 0.38)),
+        )
+        if clip.width >= 20 and clip.height >= 8:
+            try:
+                pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=clip, alpha=False)
+                png = pix.tobytes("png")
+                return "data:image/png;base64," + base64.b64encode(png).decode("ascii"), {
+                    "source": "rendered_crop_fallback",
+                    "rect": [round(clip.x0, 2), round(clip.y0, 2), round(clip.x1, 2), round(clip.y1, 2)],
+                    "pixelSize": [pix.width, pix.height],
+                }
+            except Exception as exc:
+                return "", {"source": "crop_failed", "error": str(exc)}
+
+    return "", {"source": "missing"}
+
 
 
 def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
