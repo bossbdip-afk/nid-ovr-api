@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import re
 import shutil
@@ -9,10 +10,12 @@ import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Iterable
+from pathlib import Path
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from PIL import Image, ImageOps
 
 try:
@@ -20,7 +23,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.2.0"
+APP_VERSION = "14.3.0"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -28,6 +31,18 @@ OCR_MODE = os.getenv("OCR_MODE", "auto").strip().lower()  # auto | always | off
 EXTRACT_TIMEOUT_SECONDS = float(os.getenv("EXTRACT_TIMEOUT_SECONDS", "120"))
 MAX_CONCURRENT_EXTRACTS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTS", "1")))
 EXTRACT_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTS)
+
+TEMPLATE_DATA_DIR = Path(os.getenv("TEMPLATE_DATA_DIR", "./data")).resolve()
+TEMPLATE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATE_PDF_PATH = TEMPLATE_DATA_DIR / "card-template.pdf"
+TEMPLATE_MAPPING_PATH = TEMPLATE_DATA_DIR / "card-mapping.json"
+ADMIN_TEMPLATE_KEY = os.getenv("ADMIN_TEMPLATE_KEY", "").strip()
+MAX_TEMPLATE_BYTES = int(os.getenv("MAX_TEMPLATE_BYTES", str(10 * 1024 * 1024)))
+
+def require_template_admin(request: Request) -> None:
+    if ADMIN_TEMPLATE_KEY and request.headers.get("x-admin-key", "") != ADMIN_TEMPLATE_KEY:
+        raise HTTPException(status_code=401, detail="Admin key সঠিক নয়।")
+
 
 DEFAULT_ORIGINS = [
     "https://sbtechinfo.liveblog365.com",
@@ -500,6 +515,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
         "nameEn": (["Name(English)"], False),
         "dob": (["Date of Birth"], False),
         "birthPlace": (["Birth Place"], True),
+        "bloodGroup": (["Blood Group", "Blood group"], False),
         "father": (["Father Name"], True),
         "mother": (["Mother Name"], True),
         "spouse": (["Spouse Name"], True),
@@ -532,6 +548,8 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
         t2_data = t2.extract()
         fields["religion"], debug["religion"] = simple_value(p2, t2, ["Religion"], ocr_bengali=False, data=t2_data)
         fields["voterArea"], debug["voterArea"] = simple_value(p2, t2, ["Voter Area"], ocr_bengali=True, data=t2_data)
+        if not meaningful(fields.get("bloodGroup")):
+            fields["bloodGroup"], debug["bloodGroup"] = simple_value(p2, t2, ["Blood Group", "Blood group"], ocr_bengali=False, data=t2_data)
     else:
         fields["religion"] = ""
         fields["voterArea"] = ""
@@ -578,6 +596,89 @@ async def health() -> dict[str, Any]:
         "ocr_mode": OCR_MODE,
         "ocr_scale": OCR_SCALE,
     }
+
+
+@app.get("/template/config")
+async def template_config() -> dict[str, Any]:
+    mapping = None
+    if TEMPLATE_MAPPING_PATH.exists():
+        try:
+            mapping = json.loads(TEMPLATE_MAPPING_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            mapping = None
+    return {
+        "ok": True,
+        "template_exists": TEMPLATE_PDF_PATH.exists(),
+        "mapping": mapping,
+        "persistent_note": "Render local filesystem is ephemeral unless a persistent disk is configured.",
+    }
+
+
+@app.get("/template/pdf")
+async def template_pdf():
+    if not TEMPLATE_PDF_PATH.exists():
+        raise HTTPException(status_code=404, detail="Template PDF পাওয়া যায়নি।")
+    return FileResponse(TEMPLATE_PDF_PATH, media_type="application/pdf", filename="card-template.pdf")
+
+
+@app.post("/template/pdf")
+async def upload_template_pdf(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+    require_template_admin(request)
+    name = (file.filename or "").lower()
+    if file.content_type not in {"application/pdf", "application/octet-stream"} and not name.endswith(".pdf"):
+        raise HTTPException(status_code=415, detail="Template হিসেবে শুধু PDF দিন।")
+    data = await file.read(MAX_TEMPLATE_BYTES + 1)
+    if len(data) > MAX_TEMPLATE_BYTES:
+        raise HTTPException(status_code=413, detail="Template PDF size limit-এর চেয়ে বড়।")
+    if not data.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Template ফাইলটি valid PDF নয়।")
+    tmp = TEMPLATE_PDF_PATH.with_suffix(".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(TEMPLATE_PDF_PATH)
+    return {"ok": True, "bytes": len(data), "filename": file.filename or "card-template.pdf"}
+
+
+@app.post("/template/mapping")
+async def save_template_mapping(request: Request, mapping: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    require_template_admin(request)
+    if not isinstance(mapping, dict) or not mapping:
+        raise HTTPException(status_code=400, detail="Mapping খালি হতে পারবে না।")
+    allowed = {"photo","signature","nameBn","nameEn","father","mother","dob","nid","presentAddress","birthPlace","bloodGroup","issueDate","barcode"}
+    clean: dict[str, Any] = {}
+    for field, cfg in mapping.items():
+        if field not in allowed or not isinstance(cfg, dict):
+            continue
+        try:
+            x, y, w, h = (float(cfg[k]) for k in ("x","y","w","h"))
+        except Exception:
+            continue
+        if not (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1 and x + w <= 1.001 and y + h <= 1.001):
+            continue
+        clean[field] = {
+            "x": x, "y": y, "w": w, "h": h,
+            "fontSizePct": float(cfg.get("fontSizePct", 0.018)),
+            "color": str(cfg.get("color", "#111111"))[:20],
+            "align": str(cfg.get("align", "left")) if str(cfg.get("align", "left")) in {"left","center","right"} else "left",
+            "weight": str(cfg.get("weight", "400")) if str(cfg.get("weight", "400")) in {"400","600","700"} else "400",
+            "fit": str(cfg.get("fit", "contain")) if str(cfg.get("fit", "contain")) in {"contain","cover","fill"} else "contain",
+        }
+    if not clean:
+        raise HTTPException(status_code=400, detail="Valid mapping পাওয়া যায়নি।")
+    tmp = TEMPLATE_MAPPING_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(TEMPLATE_MAPPING_PATH)
+    return {"ok": True, "fields": list(clean.keys())}
+
+
+@app.delete("/template/config")
+async def clear_template_config(request: Request) -> dict[str, Any]:
+    require_template_admin(request)
+    for path in (TEMPLATE_PDF_PATH, TEMPLATE_MAPPING_PATH):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return {"ok": True}
 
 
 @app.post("/extract")
