@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.3.5-fingerprint-xobject"
+APP_VERSION = "14.3.6-biometric-address"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -456,6 +456,11 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
     if not rows:
         return "", {"source": "missing"}
 
+    rmo, m_rmo = address_field(page, table, rows, ["RMO"], data=data)
+    municipality, m_muni = address_field(page, table, rows, ["City Corporation Or Municipality", "City Corporation/Or Municipality", "Municipality"], data=data)
+    union_ward, m_union = address_field(page, table, rows, ["Union/Ward", "Union Ward"], data=data)
+    mouza, m_mouza = address_field(page, table, rows, ["Mouza/Moholla", "Mouza Moholla"], data=data)
+    additional_mouza, m_add_mouza = address_field(page, table, rows, ["Additional Mouza/Moholla", "Additional Mouza Moholla"], data=data)
     additional_village, m_add = address_field(page, table, rows, ["Additional Village/Road"], data=data)
     village, m_vil = address_field(page, table, rows, ["Village/Road"], data=data)
     holding, m_hold = address_field(page, table, rows, ["Home/Holding No", "Home/Holding"], ocr_bengali=False, data=data)
@@ -463,12 +468,20 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
     postal, m_postal = address_field(page, table, rows, ["Postal Code", "Post Code"], ocr_bengali=False, data=data)
     upazila, m_up = address_field(page, table, rows, ["Upozila", "Upazila"], data=data)
     district, m_dist = address_field(page, table, rows, ["District"], data=data)
+    region, m_region = address_field(page, table, rows, ["Region"], data=data)
 
     v = additional_village or village
+    mz = additional_mouza or mouza
     if not meaningful(holding):
         holding = ""
 
     parts: list[str] = []
+    if municipality:
+        parts.append(f"পৌরসভা/সিটি: {municipality}")
+    if union_ward:
+        parts.append(f"ইউনিয়ন/ওয়ার্ড: {union_ward}")
+    if mz:
+        parts.append(f"মৌজা/মহল্লা: {mz}")
     if v:
         parts.append(f"গ্রাম/রাস্তা: {v}")
     if holding:
@@ -478,17 +491,26 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
     elif postal:
         parts.append("পোস্ট কোড: " + postal)
     if upazila:
-        parts.append(upazila)
+        parts.append(f"উপজেলা: {upazila}")
     if district:
-        parts.append(district)
+        parts.append(f"জেলা: {district}")
+    if region and region not in {district, upazila}:
+        parts.append(f"অঞ্চল: {region}")
+    if rmo:
+        parts.append(f"আরএমও: {rmo}")
 
     meta = {
+        "rmo": m_rmo,
+        "municipality": m_muni,
+        "unionWard": m_union,
+        "mouza": m_add_mouza if additional_mouza else m_mouza,
         "village": m_add if additional_village else m_vil,
         "holding": m_hold,
         "post": m_post,
         "postal": m_postal,
         "upazila": m_up,
         "district": m_dist,
+        "region": m_region,
     }
     return clean_bengali(", ".join(parts)), meta
 
@@ -870,7 +892,7 @@ async def save_template_mapping(request: Request, mapping: dict[str, Any] = Body
     require_template_admin(request)
     if not isinstance(mapping, dict) or not mapping:
         raise HTTPException(status_code=400, detail="Mapping খালি হতে পারবে না।")
-    allowed = {"photo","signature","fingerprint","nameBn","nameEn","father","mother","dob","nid","presentAddress","birthPlace","bloodGroup","issueDate","barcode"}
+    allowed = {"photo","signature","fingerprint","biometric","nameBn","nameEn","father","mother","dob","nid","presentAddress","birthPlace","bloodGroup","issueDate","barcode"}
     clean: dict[str, Any] = {}
     for field, cfg in mapping.items():
         if field not in allowed or not isinstance(cfg, dict):

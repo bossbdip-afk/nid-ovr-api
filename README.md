@@ -51,3 +51,8 @@ Signature fix v14.3.3: single active frontend processPDF flow, backend /SMask ex
 - `/extract` returns `fingerprintDataUrl` when a near-square fingerprint image XObject is placed below the portrait.
 - Signature extraction remains unchanged and separate.
 - Table parsing now supports PDFs with a leading blank column, so old-format forms still return identity/address fields.
+
+
+## v14.3.6
+- Signature and fingerprint now share one biometric mapping box on the frontend.
+- Present Address now includes municipality/city, union/ward, mouza/moholla, village/road, holding, post office/postal code, upazila, district, region and RMO when present. Empty address parts are skipped.
