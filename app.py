@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.6.5-address-locality-fallback"
+APP_VERSION = "14.6.6-field-name-extraction"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -148,6 +148,10 @@ def obvious_damage(s: str) -> int:
         score += 5
     if re.search(r"\s+[ঁংঃ়ািীুূৃৄেৈোৌ্ৗ]", s0):
         score += 5
+    # Same-cell visual extraction can occasionally duplicate a Bengali mark
+    # (for example, াা / ীী / ংং). Treat that candidate as damaged.
+    if re.search(r"([ঁংঃ়ািীুূৃৄেৈোৌ্ৗ])\1", s0):
+        score += 5
     if re.search(r"[^\u0980-\u09FFA-Za-z0-9\s()\-–—,./:+]", s0):
         score += 4
     # One-character Bengali fragments between otherwise Bengali tokens are a
@@ -158,6 +162,44 @@ def obvious_damage(s: str) -> int:
             score += 2
     return score
 
+
+def choose_visual_cell_text(raw: str, visual: str) -> tuple[str, str] | None:
+    """Safely repair Bengali address spacing/order from the same PDF cell.
+
+    PyMuPDF table extraction can split or reorder Bengali glyphs while the
+    page text in the exact same cell remains correct. No dictionary or
+    PDF-specific replacement is used here.
+    """
+    raw_clean = clean_bengali(raw)
+    visual_clean = clean_bengali(visual)
+    if not raw_clean or not visual_clean:
+        return None
+
+    rc = compact_for_compare(raw_clean)
+    vc = compact_for_compare(visual_clean)
+    if not rc or not vc or rc == vc:
+        return None
+
+    raw_damage = obvious_damage(raw)
+    visual_damage = obvious_damage(visual)
+    sim = similarity(raw_clean, visual_clean)
+
+    # Repair detached marks / broken fragments only if the visual text is
+    # clearly cleaner and still represents the same source value.
+    if raw_damage > visual_damage and sim >= 0.55:
+        return visual_clean, "pdf_cell_visual_repair"
+
+    # Repair pure character-order swaps only when both same-cell candidates
+    # contain exactly the same characters and the visual candidate is clean.
+    if (
+        visual_damage == 0
+        and sim >= 0.72
+        and len(rc) == len(vc)
+        and sorted(rc) == sorted(vc)
+    ):
+        return visual_clean, "pdf_cell_visual_order"
+
+    return None
 
 def only_extra_marks(raw: str, ocr: str) -> bool:
     """True when OCR merely dropped one Bengali mark that the PDF text kept."""
@@ -310,6 +352,45 @@ def choose_text(raw: str, ocr: OcrCandidate) -> tuple[str, str, float]:
     return raw_clean, "pdf_text", 100.0
 
 
+
+
+# Central field-name registry. Extraction is driven by source labels rather than
+# PDF filename/tag/layout version. Aliases here represent label spelling variants
+# only; values are never borrowed from another semantic field.
+FIELD_LABELS: dict[str, list[str]] = {
+    "nid": ["National ID"],
+    "pin": ["Pin"],
+    "siNo": ["Sl No", "SI No", "SL No", "Serial No", "Serial Number", "S/L No"],
+    "voterNo": ["Voter No"],
+    "nameBn": ["Name(Bangla)", "Name (Bangla)"],
+    "nameEn": ["Name(English)", "Name (English)"],
+    "dob": ["Date of Birth"],
+    "birthPlace": ["Birth Place"],
+    "bloodGroup": ["Blood Group", "Blood group"],
+    "father": ["Father Name"],
+    "mother": ["Mother Name"],
+    "spouse": ["Spouse Name"],
+    "gender": ["Gender"],
+    "religion": ["Religion"],
+    "voterArea": ["Voter Area"],
+}
+
+ADDRESS_FIELD_LABELS: dict[str, list[str]] = {
+    "rmo": ["RMO"],
+    "municipality": ["City Corporation Or Municipality", "City Corporation/Or Municipality", "City Corporation / Municipality", "Municipality"],
+    "unionWard": ["Union/Ward", "Union Ward"],
+    "mouzaMoholla": ["Mouza/Moholla", "Mouza Moholla"],
+    "additionalMouzaMoholla": ["Additional Mouza/Moholla", "Additional Mouza Moholla"],
+    "additionalVillageRoad": ["Additional Village/Road", "Additional Village Road"],
+    "villageRoad": ["Village/Road", "Village Road"],
+    "holding": ["Home/Holding No", "Home/Holding", "Home Holding No"],
+    "postOffice": ["Post Office", "Post Ofcfie"],
+    "postalCode": ["Postal Code", "Post Code"],
+    "upazila": ["Upozila", "Upazila"],
+    "district": ["District"],
+    "region": ["Region"],
+}
+
 # ------------------------------ Table helpers ------------------------------
 
 def norm_label(value: Any) -> str:
@@ -338,6 +419,67 @@ def get_table(page: fitz.Page):
         return None
     # NID PDFs in this family have one dominant form table per page.
     return max(tables, key=lambda t: (t.row_count * max(1, t.col_count), (fitz.Rect(t.bbox).width * fitz.Rect(t.bbox).height)))
+
+
+def get_tables(page: fitz.Page) -> list[Any]:
+    """Return every detected table on a page, largest first.
+
+    Field extraction must not assume that the wanted label lives in one
+    dominant table. Keeping all tables lets the same source field be found in
+    different PDF structures without document-specific branches.
+    """
+    try:
+        tables = list(page.find_tables().tables)
+    except Exception:
+        tables = []
+    return sorted(
+        tables,
+        key=lambda t: (t.row_count * max(1, t.col_count), fitz.Rect(t.bbox).width * fitz.Rect(t.bbox).height),
+        reverse=True,
+    )
+
+
+def collect_document_tables(doc: fitz.Document) -> list[tuple[fitz.Page, Any, list[list[Any]]]]:
+    out: list[tuple[fitz.Page, Any, list[list[Any]]]] = []
+    for page_index in range(doc.page_count):
+        page = doc[page_index]
+        for table in get_tables(page):
+            try:
+                data = table.extract()
+            except Exception:
+                continue
+            out.append((page, table, data))
+    return out
+
+
+def simple_value_any_table(
+    tables: list[tuple[fitz.Page, Any, list[list[Any]]]],
+    labels: Iterable[str],
+    *,
+    ocr_bengali: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Find a source field by label across all pages/tables."""
+    for page, table, data in tables:
+        found = find_simple_row(table, labels, data=data)
+        if not found:
+            continue
+        value, meta = simple_value(page, table, labels, ocr_bengali=ocr_bengali, data=data)
+        if meaningful(value):
+            meta = dict(meta)
+            meta["page"] = page.number + 1
+            return value, meta
+    return "", {"source": "missing"}
+
+
+def find_address_table(
+    tables: list[tuple[fitz.Page, Any, list[list[Any]]]], section: str
+) -> tuple[fitz.Page, Any, list[list[Any]]] | None:
+    """Locate the table that actually contains an address section label."""
+    for page, table, data in tables:
+        for row in data:
+            if _row_label_col(row, section, 0.84) is not None:
+                return page, table, data
+    return None
 
 
 def find_simple_row(table, labels: Iterable[str], data=None):
@@ -443,9 +585,26 @@ def address_field(page: fitz.Page, table, row_indices: list[int], labels: list[s
         raw_clean = clean_bengali(raw)
         if not ocr_bengali or not BENGALI_RE.search(str(raw or "")):
             return raw_clean, {"source": "pdf_table"}
+
+        cell = table.rows[ri].cells[vi] if vi < len(table.rows[ri].cells) else None
+        visual_text = ""
+        if cell:
+            try:
+                visual_text = page.get_text("text", clip=fitz.Rect(cell)).strip()
+            except Exception:
+                visual_text = ""
+
+        visual_choice = choose_visual_cell_text(str(raw or ""), visual_text)
+        if visual_choice is not None:
+            value, source = visual_choice
+            return value, {
+                "source": source,
+                "raw": clean_text(raw),
+                "visual": clean_text(visual_text),
+            }
+
         if not should_run_ocr(raw):
             return raw_clean, {"source": "pdf_table_fast"}
-        cell = table.rows[ri].cells[vi] if vi < len(table.rows[ri].cells) else None
         ocr = ocr_cell(page, cell)
         value, source, conf = choose_text(str(raw or ""), ocr)
         return value, {"source": source, "ocr_confidence": round(conf, 1), "raw": clean_text(raw), "ocr": ocr.text}
@@ -463,28 +622,46 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
     if not rows:
         return "", {"source": "missing"}
 
-    rmo, m_rmo = address_field(page, table, rows, ["RMO"], data=data)
-    municipality, m_muni = address_field(page, table, rows, ["City Corporation Or Municipality", "City Corporation/Or Municipality", "Municipality"], data=data)
-    union_ward, m_union = address_field(page, table, rows, ["Union/Ward", "Union Ward"], data=data)
-    mouza, m_mouza = address_field(page, table, rows, ["Mouza/Moholla", "Mouza Moholla"], data=data)
-    additional_mouza, m_add_mouza = address_field(page, table, rows, ["Additional Mouza/Moholla", "Additional Mouza Moholla"], data=data)
-    additional_village, m_add = address_field(page, table, rows, ["Additional Village/Road"], data=data)
-    village, m_vil = address_field(page, table, rows, ["Village/Road"], data=data)
-    holding, m_hold = address_field(page, table, rows, ["Home/Holding No", "Home/Holding"], ocr_bengali=False, data=data)
-    post, m_post = address_field(page, table, rows, ["Post Office", "Post Ofcfie"], data=data)
-    postal, m_postal = address_field(page, table, rows, ["Postal Code", "Post Code"], ocr_bengali=False, data=data)
-    upazila, m_up = address_field(page, table, rows, ["Upozila", "Upazila"], data=data)
-    district, m_dist = address_field(page, table, rows, ["District"], data=data)
-    region, m_region = address_field(page, table, rows, ["Region"], data=data)
+    rmo, m_rmo = address_field(page, table, rows, ADDRESS_FIELD_LABELS["rmo"], data=data)
+    municipality, m_muni = address_field(page, table, rows, ADDRESS_FIELD_LABELS["municipality"], data=data)
+    union_ward, m_union = address_field(page, table, rows, ADDRESS_FIELD_LABELS["unionWard"], data=data)
+    mouza, m_mouza = address_field(page, table, rows, ADDRESS_FIELD_LABELS["mouzaMoholla"], data=data)
+    additional_mouza, m_add_mouza = address_field(page, table, rows, ADDRESS_FIELD_LABELS["additionalMouzaMoholla"], data=data)
+    additional_village, m_add = address_field(page, table, rows, ADDRESS_FIELD_LABELS["additionalVillageRoad"], data=data)
+    village, m_vil = address_field(page, table, rows, ADDRESS_FIELD_LABELS["villageRoad"], data=data)
+    holding, m_hold = address_field(page, table, rows, ADDRESS_FIELD_LABELS["holding"], ocr_bengali=False, data=data)
+    post, m_post = address_field(page, table, rows, ADDRESS_FIELD_LABELS["postOffice"], data=data)
+    postal, m_postal = address_field(page, table, rows, ADDRESS_FIELD_LABELS["postalCode"], ocr_bengali=False, data=data)
+    upazila, m_up = address_field(page, table, rows, ADDRESS_FIELD_LABELS["upazila"], data=data)
+    district, m_dist = address_field(page, table, rows, ADDRESS_FIELD_LABELS["district"], data=data)
+    region, m_region = address_field(page, table, rows, ADDRESS_FIELD_LABELS["region"], data=data)
 
-    # Locality fallback for PDFs where Village/Road is blank.
-    # Keep the source hierarchy conservative: use the actual Village/Road first,
-    # then progressively broader locality fields without inventing values.
-    v = village or additional_village or additional_mouza or mouza or municipality
+    # Locality fallback is used only when the primary Village/Road field is blank.
+    # Keep every source field distinct: a Mouza/Moholla value must never be
+    # reported or stored as if it came from Village/Road.
+    locality_value = ""
+    locality_source = ""
+    locality_label = ""
+    locality_fallback = False
+    locality_candidates = [
+        ("villageRoad", "গ্রাম/রাস্তা", village, False),
+        ("additionalVillageRoad", "অতিরিক্ত গ্রাম/রাস্তা", additional_village, True),
+        ("mouzaMoholla", "মৌজা/মহল্লা", mouza, True),
+        ("additionalMouzaMoholla", "অতিরিক্ত মৌজা/মহল্লা", additional_mouza, True),
+        ("municipality", "পৌরসভা/সিটি", municipality, True),
+    ]
+    for source_name, display_label, candidate, is_fallback in locality_candidates:
+        if meaningful(candidate):
+            locality_value = candidate
+            locality_source = source_name
+            locality_label = display_label
+            locality_fallback = is_fallback
+            break
+
     parts: list[str] = []
 
-    if meaningful(v):
-        parts.append(f"গ্রাম/রাস্তা: {clean_bengali(v)}")
+    if meaningful(locality_value):
+        parts.append(f"{locality_label}: {clean_bengali(locality_value)}")
 
     if meaningful(post):
         post_part = f"ডাকঘর: {clean_bengali(post)}"
@@ -505,19 +682,21 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
         "rmo": m_rmo,
         "municipality": m_muni,
         "unionWard": m_union,
-        "mouza": m_add_mouza if meaningful(additional_mouza) else m_mouza,
-        "village": (m_vil if meaningful(village) else
-                    m_add if meaningful(additional_village) else
-                    m_add_mouza if meaningful(additional_mouza) else
-                    m_mouza if meaningful(mouza) else m_muni),
+        # Keep legacy debug keys source-true instead of collapsing fallback fields.
+        "mouza": m_mouza,
+        "village": m_vil,
         "holding": m_hold,
         "post": m_post,
         "postal": m_postal,
         "upazila": m_up,
         "district": m_dist,
         "region": m_region,
-        "components": {
-            "villageRoad": clean_bengali(v) if meaningful(v) else "",
+        # Preserve exact field-to-field extraction for diagnostics.
+        "sourceFields": {
+            "villageRoad": clean_bengali(village) if meaningful(village) else "",
+            "additionalVillageRoad": clean_bengali(additional_village) if meaningful(additional_village) else "",
+            "mouzaMoholla": clean_bengali(mouza) if meaningful(mouza) else "",
+            "additionalMouzaMoholla": clean_bengali(additional_mouza) if meaningful(additional_mouza) else "",
             "postOffice": clean_bengali(post) if meaningful(post) else "",
             "postalCode": clean_text(postal) if meaningful(postal) else "",
             "upazila": clean_bengali(upazila) if meaningful(upazila) else "",
@@ -525,7 +704,27 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
             "holding": clean_bengali(holding) if meaningful(holding) else "",
             "unionWard": clean_bengali(union_ward) if meaningful(union_ward) else "",
             "municipality": clean_bengali(municipality) if meaningful(municipality) else "",
-            "mouza": clean_bengali(additional_mouza or mouza) if meaningful(additional_mouza or mouza) else "",
+            "region": clean_bengali(region) if meaningful(region) else "",
+            "rmo": clean_bengali(rmo) if meaningful(rmo) else "",
+        },
+        "localitySelection": {
+            "sourceField": locality_source,
+            "value": clean_bengali(locality_value) if meaningful(locality_value) else "",
+            "displayLabel": locality_label,
+            "fallbackUsed": locality_fallback,
+        },
+        "components": {
+            "villageRoad": clean_bengali(village) if meaningful(village) else "",
+            "additionalVillageRoad": clean_bengali(additional_village) if meaningful(additional_village) else "",
+            "mouzaMoholla": clean_bengali(mouza) if meaningful(mouza) else "",
+            "additionalMouzaMoholla": clean_bengali(additional_mouza) if meaningful(additional_mouza) else "",
+            "postOffice": clean_bengali(post) if meaningful(post) else "",
+            "postalCode": clean_text(postal) if meaningful(postal) else "",
+            "upazila": clean_bengali(upazila) if meaningful(upazila) else "",
+            "district": clean_bengali(district) if meaningful(district) else "",
+            "holding": clean_bengali(holding) if meaningful(holding) else "",
+            "unionWard": clean_bengali(union_ward) if meaningful(union_ward) else "",
+            "municipality": clean_bengali(municipality) if meaningful(municipality) else "",
             "region": clean_bengali(region) if meaningful(region) else "",
             "rmo": clean_bengali(rmo) if meaningful(rmo) else "",
         },
@@ -746,39 +945,25 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     p1 = doc[0]
     signature_data_url, signature_debug = extract_cardholder_signature(doc, p1)
     fingerprint_data_url, fingerprint_debug = extract_cardholder_fingerprint(doc, p1)
-    t1 = get_table(p1)
-    if t1 is None:
-        raise ValueError("প্রথম page-এর NID table শনাক্ত করা যায়নি।")
-    # table.extract() itself is not free on Render. v14.2 called it again for
-    # every field/address lookup. Extract the detected table once and reuse the
-    # exact same rows for all lookups; parsing behavior stays unchanged.
-    t1_data = t1.extract()
 
-    # IMPORTANT: process page 1 before calling find_tables() on another page.
-    # PyMuPDF table finder objects are page-bound and some versions reuse
-    # internal finder state across calls.
-    p2 = doc[1] if doc.page_count > 1 else None
+    # Field discovery is document-wide: every detected table on every page is
+    # eligible. PDF tag/name/old-new format is intentionally ignored.
+    document_tables = collect_document_tables(doc)
+    if not document_tables:
+        raise ValueError("PDF-এ কোনো field table শনাক্ত করা যায়নি।")
 
     fields: dict[str, str] = {}
     debug: dict[str, Any] = {}
 
-    simple_specs = {
-        "nid": (["National ID"], False),
-        "pin": (["Pin"], False),
-        "siNo": (["Sl No", "SI No", "SL No", "Serial No", "Serial Number", "S/L No"], False),
-        "voterNo": (["Voter No"], False),
-        "nameBn": (["Name(Bangla)"], True),
-        "nameEn": (["Name(English)"], False),
-        "dob": (["Date of Birth"], False),
-        "birthPlace": (["Birth Place"], True),
-        "bloodGroup": (["Blood Group", "Blood group"], False),
-        "father": (["Father Name"], True),
-        "mother": (["Mother Name"], True),
-        "spouse": (["Spouse Name"], True),
-        "gender": (["Gender"], False),
-    }
-    for key, (labels, use_ocr) in simple_specs.items():
-        fields[key], debug[key] = simple_value(p1, t1, labels, ocr_bengali=use_ocr, data=t1_data)
+    ocr_fields = {"nameBn", "birthPlace", "father", "mother", "spouse", "voterArea"}
+    for key in (
+        "nid", "pin", "siNo", "voterNo", "nameBn", "nameEn", "dob",
+        "birthPlace", "bloodGroup", "father", "mother", "spouse", "gender",
+        "religion", "voterArea",
+    ):
+        fields[key], debug[key] = simple_value_any_table(
+            document_tables, FIELD_LABELS[key], ocr_bengali=key in ocr_fields
+        )
 
     # Some NID PDFs expose the serial label outside the detected table or split
     # the label/value into separate text spans. If the normal table lookup did
@@ -796,21 +981,23 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
                 debug["siNo"] = {"source": "pdf_text_fallback"}
                 break
 
-    fields["presentAddress"], debug["presentAddress"] = build_address(p1, t1, "Present Address", "Permanent Address", data=t1_data)
-    fields["permanentAddress"], debug["permanentAddress"] = build_address(p1, t1, "Permanent Address", "Foreign Address", data=t1_data)
-
-    t2 = get_table(p2) if p2 is not None else None
-    if p2 is not None and t2 is not None:
-        t2_data = t2.extract()
-        fields["religion"], debug["religion"] = simple_value(p2, t2, ["Religion"], ocr_bengali=False, data=t2_data)
-        fields["voterArea"], debug["voterArea"] = simple_value(p2, t2, ["Voter Area"], ocr_bengali=True, data=t2_data)
-        if not meaningful(fields.get("bloodGroup")):
-            fields["bloodGroup"], debug["bloodGroup"] = simple_value(p2, t2, ["Blood Group", "Blood group"], ocr_bengali=False, data=t2_data)
+    present_source = find_address_table(document_tables, "Present Address")
+    if present_source:
+        page, table, data = present_source
+        fields["presentAddress"], debug["presentAddress"] = build_address(page, table, "Present Address", "Permanent Address", data=data)
+        debug["presentAddress"]["page"] = page.number + 1
     else:
-        fields["religion"] = ""
-        fields["voterArea"] = ""
-        debug["religion"] = {"source": "missing"}
-        debug["voterArea"] = {"source": "missing"}
+        fields["presentAddress"] = ""
+        debug["presentAddress"] = {"source": "missing"}
+
+    permanent_source = find_address_table(document_tables, "Permanent Address")
+    if permanent_source:
+        page, table, data = permanent_source
+        fields["permanentAddress"], debug["permanentAddress"] = build_address(page, table, "Permanent Address", "Foreign Address", data=data)
+        debug["permanentAddress"]["page"] = page.number + 1
+    else:
+        fields["permanentAddress"] = ""
+        debug["permanentAddress"] = {"source": "missing"}
 
     # Final generic normalization pass. Do not invent missing values.
     for k, v in list(fields.items()):
