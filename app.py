@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.6.14-admin-login"
+APP_VERSION = "14.6.15-home-holding"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -743,6 +743,11 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
 
     parts: list[str] = []
     postal_display = to_bengali_digits(postal) if bengali_postal_digits else clean_text(postal)
+
+    # Always keep the Home/Holding slot visible in the compact card address.
+    # Use the extracted source value when present; otherwise show a dot placeholder.
+    holding_display = clean_bengali(holding) if meaningful(holding) else "."
+    parts.append(f"বাসা/হোল্ডিং: {holding_display}")
 
     if meaningful(locality_value):
         # Card display keeps the legacy compact address label regardless of
