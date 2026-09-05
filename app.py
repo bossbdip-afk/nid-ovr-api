@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.6.6-field-name-extraction"
+APP_VERSION = "14.6.13-postal-bengali-digits"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -111,6 +111,10 @@ def clean_bengali(value: Any, *, allow_ascii: bool = True) -> str:
         (r"^ম(?:ে|ো)া?ছাঃ", "মোছাঃ"),
         (r"^মো\s+ছাঃ", "মোছাঃ"),
         (r"^মা\s*ছাঃ", "মোছাঃ"),
+        # Some source PDFs split the female honorific across a text-map
+        # boundary even though the same cell visually reads "মোসাঃ".
+        # This repairs spacing only; it does not replace any person-name word.
+        (r"^মো\s+সাঃ(?=\s|$)", "মোসাঃ"),
     ]
     for pat, repl in honorific_rules:
         s = re.sub(pat, repl, s)
@@ -128,12 +132,27 @@ def clean_bengali(value: Any, *, allow_ascii: bool = True) -> str:
 
     s = re.sub(r"\s+", " ", s).strip(" ,;|/")
     s = re.sub(r"ঃ{2,}", "ঃ", s)
+
+    # Re-attach a lone Bengali glyph fragment to the preceding Bengali token.
+    # Broken PDF text maps commonly detach the final consonant (e.g. "আছফু ল").
+    # Keep the real standalone conjunction "ও" untouched.
+    s = re.sub(r"([\u0980-\u09FF]{2,})\s+([\u0980-\u09FF])(?![\u0980-\u09FF])",
+               lambda m: m.group(0) if m.group(2) == "ও" else m.group(1) + m.group(2), s)
     return s.strip()
 
 
 def meaningful(value: Any) -> bool:
     s = clean_text(value)
     return bool(s and not TRIVIAL_PUNCT_RE.match(s))
+
+
+def to_bengali_digits(value: Any) -> str:
+    """Convert ASCII digits to Bengali digits for display only.
+
+    Source extraction/debug values remain unchanged so field provenance and
+    original PDF data can still be inspected exactly as parsed.
+    """
+    return clean_text(value).translate(str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯"))
 
 
 def compact_for_compare(s: str) -> str:
@@ -146,6 +165,9 @@ def obvious_damage(s: str) -> int:
     score = 0
     if re.search(r"ঃ{2,}", s0):
         score += 5
+    # Malformed honorific produced by glyph-order extraction (e.g. মোঃাঃ).
+    if re.search(r"মোঃ[ািীুূৃেৈোৌ]+ঃ", s0):
+        score += 15
     if re.search(r"\s+[ঁংঃ়ািীুূৃৄেৈোৌ্ৗ]", s0):
         score += 5
     # Same-cell visual extraction can occasionally duplicate a Bengali mark
@@ -163,6 +185,38 @@ def obvious_damage(s: str) -> int:
     return score
 
 
+def exact_cell_text(page: fitz.Page, cell) -> str:
+    """Rebuild text from the exact PDF glyphs inside one table cell.
+
+    PyMuPDF's higher-level text/table extraction can invent spaces between
+    Bengali glyph runs. Here we preserve only spaces that physically exist as
+    space glyphs in the source PDF, and use one space only between visual lines.
+    This is generic and field/PDF independent.
+    """
+    if not cell:
+        return ""
+    try:
+        rawdict = page.get_text("rawdict", clip=fitz.Rect(cell))
+    except Exception:
+        return ""
+    lines: list[str] = []
+    for block in rawdict.get("blocks", []):
+        for line in block.get("lines", []):
+            chars: list[str] = []
+            for span in line.get("spans", []):
+                for ch in span.get("chars", []):
+                    chars.append(str(ch.get("c", "")))
+            line_text = "".join(chars).strip()
+            if line_text:
+                lines.append(line_text)
+    text = clean_text(" ".join(lines))
+    # Some Bengali PDF fonts expose the same combining mark twice at the same
+    # visual position. Collapse only adjacent duplicate combining marks; this
+    # does not merge separate words or alter base letters.
+    text = re.sub(r"([ঁংঃ়ািীুূৃৄেৈোৌ্ৗ])\1+", r"\1", text)
+    return text
+
+
 def choose_visual_cell_text(raw: str, visual: str) -> tuple[str, str] | None:
     """Safely repair Bengali address spacing/order from the same PDF cell.
 
@@ -177,8 +231,15 @@ def choose_visual_cell_text(raw: str, visual: str) -> tuple[str, str] | None:
 
     rc = compact_for_compare(raw_clean)
     vc = compact_for_compare(visual_clean)
-    if not rc or not vc or rc == vc:
+    if not rc or not vc:
         return None
+
+    # If both candidates contain the same characters and differ only by
+    # whitespace, prefer the exact-cell glyph reconstruction. Table extraction
+    # can invent spaces inside Bengali words (e.g. "মৌ জা"), whereas the raw
+    # glyph stream preserves only real source spaces.
+    if rc == vc and raw_clean != visual_clean:
+        return visual_clean, "pdf_cell_explicit_spacing"
 
     raw_damage = obvious_damage(raw)
     visual_damage = obvious_damage(visual)
@@ -522,9 +583,29 @@ def simple_value(page: fitz.Page, table, labels: Iterable[str], *, ocr_bengali: 
     raw_clean = clean_bengali(raw) if BENGALI_RE.search(str(raw or "")) else clean_text(raw)
     if not ocr_bengali or not BENGALI_RE.search(str(raw or "")):
         return raw_clean, {"source": "pdf_table"}
+
+    # Bengali identity fields can suffer the same table-text spacing/order
+    # damage as address cells. Prefer the native text from the exact same PDF
+    # cell only when the conservative visual comparator proves it is cleaner.
+    # This is field-agnostic and does not use name/place dictionaries.
+    cell = table.rows[ri].cells[vi] if vi < len(table.rows[ri].cells) else None
+    visual_text = ""
+    if cell:
+        try:
+            visual_text = page.get_text("text", clip=fitz.Rect(cell)).strip()
+        except Exception:
+            visual_text = ""
+    visual_choice = choose_visual_cell_text(str(raw or ""), visual_text)
+    if visual_choice is not None:
+        value, source = visual_choice
+        return value, {
+            "source": source,
+            "raw": clean_text(raw),
+            "visual": clean_text(visual_text),
+        }
+
     if not should_run_ocr(raw):
         return raw_clean, {"source": "pdf_table_fast"}
-    cell = table.rows[ri].cells[vi] if vi < len(table.rows[ri].cells) else None
     ocr = ocr_cell(page, cell)
     value, source, conf = choose_text(str(raw or ""), ocr)
     return value, {"source": source, "ocr_confidence": round(conf, 1), "raw": clean_text(raw), "ocr": ocr.text}
@@ -590,7 +671,7 @@ def address_field(page: fitz.Page, table, row_indices: list[int], labels: list[s
         visual_text = ""
         if cell:
             try:
-                visual_text = page.get_text("text", clip=fitz.Rect(cell)).strip()
+                visual_text = exact_cell_text(page, cell)
             except Exception:
                 visual_text = ""
 
@@ -610,7 +691,7 @@ def address_field(page: fitz.Page, table, row_indices: list[int], labels: list[s
         return value, {"source": source, "ocr_confidence": round(conf, 1), "raw": clean_text(raw), "ocr": ocr.text}
     return "", {"source": "missing"}
 
-def build_address(page: fitz.Page, table, section: str, next_section: str | None, data=None) -> tuple[str, dict[str, Any]]:
+def build_address(page: fitz.Page, table, section: str, next_section: str | None, data=None, *, bengali_postal_digits: bool = False) -> tuple[str, dict[str, Any]]:
     """Build the compact card address without dropping source values.
 
     Card output follows the compact reference-card format:
@@ -659,18 +740,22 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
             break
 
     parts: list[str] = []
+    postal_display = to_bengali_digits(postal) if bengali_postal_digits else clean_text(postal)
 
     if meaningful(locality_value):
-        parts.append(f"{locality_label}: {clean_bengali(locality_value)}")
+        # Card display keeps the legacy compact address label regardless of
+        # which source field supplied the fallback value. Source provenance
+        # remains available below in localitySelection/sourceFields.
+        parts.append(f"গ্রাম/রাস্তা: {clean_bengali(locality_value)}")
 
     if meaningful(post):
         post_part = f"ডাকঘর: {clean_bengali(post)}"
         if meaningful(postal):
-            post_part += f" - {clean_text(postal)}"
+            post_part += f" - {postal_display}"
         parts.append(post_part)
     elif meaningful(postal):
         # Do not mistake Postal Code for Post Office when the source value is blank.
-        parts.append(f"পোস্ট কোড: {clean_text(postal)}")
+        parts.append(f"পোস্ট কোড: {postal_display}")
 
     if meaningful(upazila):
         parts.append(clean_bengali(upazila))
@@ -710,7 +795,8 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
         "localitySelection": {
             "sourceField": locality_source,
             "value": clean_bengali(locality_value) if meaningful(locality_value) else "",
-            "displayLabel": locality_label,
+            "displayLabel": "গ্রাম/রাস্তা" if meaningful(locality_value) else "",
+            "sourceLabel": locality_label,
             "fallbackUsed": locality_fallback,
         },
         "components": {
@@ -984,7 +1070,7 @@ def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     present_source = find_address_table(document_tables, "Present Address")
     if present_source:
         page, table, data = present_source
-        fields["presentAddress"], debug["presentAddress"] = build_address(page, table, "Present Address", "Permanent Address", data=data)
+        fields["presentAddress"], debug["presentAddress"] = build_address(page, table, "Present Address", "Permanent Address", data=data, bengali_postal_digits=True)
         debug["presentAddress"]["page"] = page.number + 1
     else:
         fields["presentAddress"] = ""
