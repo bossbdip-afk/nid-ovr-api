@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.6.3-address-compact-robust"
+APP_VERSION = "14.6.5-address-locality-fallback"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -477,7 +477,10 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
     district, m_dist = address_field(page, table, rows, ["District"], data=data)
     region, m_region = address_field(page, table, rows, ["Region"], data=data)
 
-    v = additional_village or village
+    # Locality fallback for PDFs where Village/Road is blank.
+    # Keep the source hierarchy conservative: use the actual Village/Road first,
+    # then progressively broader locality fields without inventing values.
+    v = village or additional_village or additional_mouza or mouza or municipality
     parts: list[str] = []
 
     if meaningful(v):
@@ -503,7 +506,10 @@ def build_address(page: fitz.Page, table, section: str, next_section: str | None
         "municipality": m_muni,
         "unionWard": m_union,
         "mouza": m_add_mouza if meaningful(additional_mouza) else m_mouza,
-        "village": m_add if meaningful(additional_village) else m_vil,
+        "village": (m_vil if meaningful(village) else
+                    m_add if meaningful(additional_village) else
+                    m_add_mouza if meaningful(additional_mouza) else
+                    m_mouza if meaningful(mouza) else m_muni),
         "holding": m_hold,
         "post": m_post,
         "postal": m_postal,
