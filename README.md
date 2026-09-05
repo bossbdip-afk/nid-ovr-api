@@ -57,7 +57,7 @@ Signature fix v14.3.3: single active frontend processPDF flow, backend /SMask ex
 - Signature and fingerprint now share one biometric mapping box on the frontend.
 - Present Address now includes municipality/city, union/ward, mouza/moholla, village/road, holding, post office/postal code, upazila, district, region and RMO when present. Empty address parts are skipped.
 
-## v14.3.7
-- Fingerprint PNGs are auto-trimmed to remove PDF frame lines and excess white scanner margins; no stretching is applied.
-- Present Address is restored to the compact format: Village/Road, Post Office + Postal Code, Upazila, District only.
-- Signature extraction logic is unchanged.
+
+## v14.6.3
+- Present/Permanent address output uses compact card format: Village/Road, Post Office + Postal Code, Upazila, District.
+- Source address components remain available in debug metadata; blank source fields are not invented.

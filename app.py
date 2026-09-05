@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.3.7-biometric-trim-compact-address"
+APP_VERSION = "14.6.3-address-compact-robust"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -452,47 +452,79 @@ def address_field(page: fitz.Page, table, row_indices: list[int], labels: list[s
     return "", {"source": "missing"}
 
 def build_address(page: fitz.Page, table, section: str, next_section: str | None, data=None) -> tuple[str, dict[str, Any]]:
-    """Build the compact address string used by the original frontend.
+    """Build the compact card address without dropping source values.
 
-    Output order is intentionally limited to:
+    Card output follows the compact reference-card format:
     Village/Road -> Post Office + Postal Code -> Upazila -> District.
-    Empty fields are skipped. Municipality, ward, mouza, region and RMO remain
-    available in the source PDF but are not rendered in the user-facing address.
+    Other source address pieces are preserved in debug metadata only.
+    Blank values are never invented.
     """
     rows = address_rows(table, section, next_section, data=data)
     if not rows:
         return "", {"source": "missing"}
 
+    rmo, m_rmo = address_field(page, table, rows, ["RMO"], data=data)
+    municipality, m_muni = address_field(page, table, rows, ["City Corporation Or Municipality", "City Corporation/Or Municipality", "Municipality"], data=data)
+    union_ward, m_union = address_field(page, table, rows, ["Union/Ward", "Union Ward"], data=data)
+    mouza, m_mouza = address_field(page, table, rows, ["Mouza/Moholla", "Mouza Moholla"], data=data)
+    additional_mouza, m_add_mouza = address_field(page, table, rows, ["Additional Mouza/Moholla", "Additional Mouza Moholla"], data=data)
     additional_village, m_add = address_field(page, table, rows, ["Additional Village/Road"], data=data)
     village, m_vil = address_field(page, table, rows, ["Village/Road"], data=data)
+    holding, m_hold = address_field(page, table, rows, ["Home/Holding No", "Home/Holding"], ocr_bengali=False, data=data)
     post, m_post = address_field(page, table, rows, ["Post Office", "Post Ofcfie"], data=data)
     postal, m_postal = address_field(page, table, rows, ["Postal Code", "Post Code"], ocr_bengali=False, data=data)
     upazila, m_up = address_field(page, table, rows, ["Upozila", "Upazila"], data=data)
     district, m_dist = address_field(page, table, rows, ["District"], data=data)
+    region, m_region = address_field(page, table, rows, ["Region"], data=data)
 
     v = additional_village or village
     parts: list[str] = []
-    if v:
-        parts.append(f"গ্রাম/রাস্তা: {v}")
-    if post:
-        parts.append("ডাকঘর: " + post + ((" " + postal) if postal else ""))
-    elif postal:
-        parts.append("পোস্ট কোড: " + postal)
-    if upazila:
-        parts.append(upazila)
-    if district:
-        parts.append(district)
+
+    if meaningful(v):
+        parts.append(f"গ্রাম/রাস্তা: {clean_bengali(v)}")
+
+    if meaningful(post):
+        post_part = f"ডাকঘর: {clean_bengali(post)}"
+        if meaningful(postal):
+            post_part += f" - {clean_text(postal)}"
+        parts.append(post_part)
+    elif meaningful(postal):
+        # Do not mistake Postal Code for Post Office when the source value is blank.
+        parts.append(f"পোস্ট কোড: {clean_text(postal)}")
+
+    if meaningful(upazila):
+        parts.append(clean_bengali(upazila))
+    if meaningful(district):
+        parts.append(clean_bengali(district))
 
     meta = {
-        "village": m_add if additional_village else m_vil,
+        "source": "pdf_table_compact",
+        "rmo": m_rmo,
+        "municipality": m_muni,
+        "unionWard": m_union,
+        "mouza": m_add_mouza if meaningful(additional_mouza) else m_mouza,
+        "village": m_add if meaningful(additional_village) else m_vil,
+        "holding": m_hold,
         "post": m_post,
         "postal": m_postal,
         "upazila": m_up,
         "district": m_dist,
-        "format": "compact_village_post_upazila_district",
+        "region": m_region,
+        "components": {
+            "villageRoad": clean_bengali(v) if meaningful(v) else "",
+            "postOffice": clean_bengali(post) if meaningful(post) else "",
+            "postalCode": clean_text(postal) if meaningful(postal) else "",
+            "upazila": clean_bengali(upazila) if meaningful(upazila) else "",
+            "district": clean_bengali(district) if meaningful(district) else "",
+            "holding": clean_bengali(holding) if meaningful(holding) else "",
+            "unionWard": clean_bengali(union_ward) if meaningful(union_ward) else "",
+            "municipality": clean_bengali(municipality) if meaningful(municipality) else "",
+            "mouza": clean_bengali(additional_mouza or mouza) if meaningful(additional_mouza or mouza) else "",
+            "region": clean_bengali(region) if meaningful(region) else "",
+            "rmo": clean_bengali(rmo) if meaningful(rmo) else "",
+        },
     }
-    return clean_bengali(", ".join(parts)), meta
-
+    return ", ".join(parts), meta
 
 
 def _pixmap_png_data_url(doc: fitz.Document, xref: int, smask: int = 0) -> str:
@@ -628,74 +660,6 @@ def extract_cardholder_signature(doc: fitz.Document, page: fitz.Page) -> tuple[s
 
 
 
-def _trim_fingerprint_data_url(data_url: str) -> tuple[str, dict[str, Any]]:
-    """Trim frame lines and excess whitespace around a fingerprint scan.
-
-    Keeps the natural aspect ratio. The returned image is cropped only; it is
-    never stretched. This specifically handles the old-format PDF fingerprint
-    XObject that contains a black frame line and extra white margins.
-    """
-    try:
-        prefix = "data:image/png;base64,"
-        if not data_url.startswith(prefix):
-            return data_url, {"trimmed": False, "reason": "not_png_data_url"}
-        raw = base64.b64decode(data_url[len(prefix):])
-        im = Image.open(io.BytesIO(raw)).convert("L")
-        w, h = im.size
-        if w < 20 or h < 20:
-            return data_url, {"trimmed": False, "reason": "too_small", "originalSize": [w, h]}
-
-        px = im.load()
-        # Erase full-length frame lines on the outer edge (common in the supplied old PDF).
-        for x in range(min(max(3, int(w * 0.04)), w)):
-            ratio = sum(1 for y in range(h) if px[x, y] < 155) / max(1, h)
-            if ratio > 0.70:
-                for y in range(h): px[x, y] = 255
-        for x in range(max(0, w-max(3, int(w * 0.04))), w):
-            ratio = sum(1 for y in range(h) if px[x, y] < 155) / max(1, h)
-            if ratio > 0.70:
-                for y in range(h): px[x, y] = 255
-        for y in range(min(max(3, int(h * 0.04)), h)):
-            ratio = sum(1 for x in range(w) if px[x, y] < 155) / max(1, w)
-            if ratio > 0.70:
-                for x in range(w): px[x, y] = 255
-        for y in range(max(0, h-max(3, int(h * 0.04))), h):
-            ratio = sum(1 for x in range(w) if px[x, y] < 155) / max(1, w)
-            if ratio > 0.70:
-                for x in range(w): px[x, y] = 255
-
-        # Projection-based crop is more robust than a plain bbox because faint scanner
-        # noise can touch the outer border. Require a small amount of dark ridge content
-        # in each retained row/column.
-        threshold = 185
-        col_hits = []
-        for x in range(w):
-            ratio = sum(1 for y in range(h) if px[x, y] < threshold) / max(1, h)
-            if ratio >= 0.03:
-                col_hits.append(x)
-        row_hits = []
-        for y in range(h):
-            ratio = sum(1 for x in range(w) if px[x, y] < threshold) / max(1, w)
-            if ratio >= 0.03:
-                row_hits.append(y)
-        if not col_hits or not row_hits:
-            return data_url, {"trimmed": False, "reason": "no_content", "originalSize": [w, h]}
-
-        x0, x1 = min(col_hits), max(col_hits) + 1
-        y0, y1 = min(row_hits), max(row_hits) + 1
-        pad_x = max(3, int((x1 - x0) * 0.04))
-        pad_y = max(3, int((y1 - y0) * 0.04))
-        x0 = max(0, x0 - pad_x); x1 = min(w, x1 + pad_x)
-        y0 = max(0, y0 - pad_y); y1 = min(h, y1 + pad_y)
-
-        cropped = im.crop((x0, y0, x1, y1)).convert("RGB")
-        out = io.BytesIO(); cropped.save(out, format="PNG", optimize=True)
-        url = prefix + base64.b64encode(out.getvalue()).decode("ascii")
-        return url, {"trimmed": True, "originalSize": [w, h], "cropBox": [x0, y0, x1, y1], "trimmedSize": list(cropped.size)}
-    except Exception as exc:
-        return data_url, {"trimmed": False, "reason": "error", "error": str(exc)[:160]}
-
-
 def extract_cardholder_fingerprint(doc: fitz.Document, page: fitz.Page) -> tuple[str, dict[str, Any]]:
     """Extract a fingerprint image placed below the portrait on page 1.
 
@@ -760,12 +724,10 @@ def extract_cardholder_fingerprint(doc: fitz.Document, page: fitz.Page) -> tuple
     if not data_url:
         return "", {"source":"missing","reason":"image_decode_failed"}
     r=best["rect"]
-    trimmed_url, trim_debug = _trim_fingerprint_data_url(data_url)
-    return trimmed_url,{"source":"pdf_image_xobject","xref":best["xref"],"smask":best["smask"],
+    return data_url,{"source":"pdf_image_xobject","xref":best["xref"],"smask":best["smask"],
                      "pixelSize":[best["w"],best["h"]],
                      "rect":[round(r.x0,2),round(r.y0,2),round(r.x1,2),round(r.y1,2)],
-                     "portraitRect":[round(pr.x0,2),round(pr.y0,2),round(pr.x1,2),round(pr.y1,2)],
-                     "trim":trim_debug}
+                     "portraitRect":[round(pr.x0,2),round(pr.y0,2),round(pr.x1,2),round(pr.y1,2)]}
 
 def extract_document(pdf_bytes: bytes) -> dict[str, Any]:
     try:
