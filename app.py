@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
-APP_VERSION = "14.6.13-postal-bengali-digits"
+APP_VERSION = "14.6.14-admin-login"
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 OCR_LANG = os.getenv("OCR_LANG", "ben+eng")
 OCR_SCALE = float(os.getenv("OCR_SCALE", "2.2"))
@@ -41,7 +41,9 @@ ADMIN_TEMPLATE_KEY = os.getenv("ADMIN_TEMPLATE_KEY", "").strip()
 MAX_TEMPLATE_BYTES = int(os.getenv("MAX_TEMPLATE_BYTES", str(10 * 1024 * 1024)))
 
 def require_template_admin(request: Request) -> None:
-    if ADMIN_TEMPLATE_KEY and request.headers.get("x-admin-key", "") != ADMIN_TEMPLATE_KEY:
+    if not ADMIN_TEMPLATE_KEY:
+        raise HTTPException(status_code=503, detail="Admin login Render-এ configure করা হয়নি।")
+    if request.headers.get("x-admin-key", "") != ADMIN_TEMPLATE_KEY:
         raise HTTPException(status_code=401, detail="Admin key সঠিক নয়।")
 
 
@@ -1127,6 +1129,17 @@ async def health() -> dict[str, Any]:
         "ocr_mode": OCR_MODE,
         "ocr_scale": OCR_SCALE,
     }
+
+
+
+@app.post("/admin/login")
+async def admin_login(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    if not ADMIN_TEMPLATE_KEY:
+        raise HTTPException(status_code=503, detail="Admin login Render-এ configure করা হয়নি।")
+    key = str(payload.get("key", "")).strip()
+    if not key or key != ADMIN_TEMPLATE_KEY:
+        raise HTTPException(status_code=401, detail="Admin key সঠিক নয়।")
+    return {"ok": True}
 
 
 @app.get("/template/config")
